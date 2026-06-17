@@ -1123,6 +1123,12 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last.tool_results = list(last.tool_results) + list(msg.tool_results)
                 total_tool_results_merged += len(msg.tool_results)
             
+            # Merge images for user messages
+            if msg.role == "user" and msg.images:
+                if last.images is None:
+                    last.images = []
+                last.images = list(last.images) + list(msg.images)
+            
             # Count merges by role
             if msg.role in merge_counts:
                 merge_counts[msg.role] += 1
