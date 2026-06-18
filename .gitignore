@@ -10,6 +10,7 @@ state.json
 .shard/
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -33,3 +34,4 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/*.log
+kiro-gateway.pid
