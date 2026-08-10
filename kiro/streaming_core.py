@@ -152,12 +152,14 @@ async def parse_kiro_stream(
         
         # Wait for first chunk with timeout
         try:
+            _t0 = asyncio.get_event_loop().time()
             logger.debug(f"Waiting for first token (timeout={first_token_timeout}s)...")
             first_byte_chunk = await asyncio.wait_for(
                 byte_iterator.__anext__(),
                 timeout=first_token_timeout
             )
-            logger.debug("First token received")
+            _first_token_ms = (asyncio.get_event_loop().time() - _t0) * 1000
+            logger.info(f"[FirstToken] received in {_first_token_ms:.0f}ms")
         except asyncio.TimeoutError:
             logger.warning(f"[FirstTokenTimeout] Model did not respond within {first_token_timeout}s")
             raise FirstTokenTimeoutError(f"No response within {first_token_timeout} seconds")

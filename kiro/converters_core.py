@@ -1352,7 +1352,6 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             
             user_input = {
                 "content": content,
-                "modelId": model_id,
                 "origin": "AI_EDITOR",
             }
             

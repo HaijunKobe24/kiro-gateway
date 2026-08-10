@@ -3766,7 +3766,7 @@ class TestBuildKiroHistory:
         assert len(result) == 1
         assert "userInputMessage" in result[0]
         assert result[0]["userInputMessage"]["content"] == "Hello"
-        assert result[0]["userInputMessage"]["modelId"] == "claude-sonnet-4"
+        assert "modelId" not in result[0]["userInputMessage"]  # modelId only on currentMessage
     
     def test_builds_assistant_message(self):
         """
