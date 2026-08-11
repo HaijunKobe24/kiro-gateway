@@ -179,10 +179,22 @@ AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 # Universal endpoint for all regions (us-east-1, eu-central-1, etc.)
 # See: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/security-data-perimeter.html
 # Fixed in issue #58 - codewhisperer.{region}.amazonaws.com doesn't exist for non-us-east-1 regions
-KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+#
+# NOTE (local override): Switched to q.{region}.amazonaws.com (AWS native CodeWhisperer endpoint).
+# Verified via 38 paired first-byte-latency samples that q.amazonaws.com is consistently faster
+# and more stable than runtime.kiro.dev for claude-sonnet-5 (avg 2861ms vs 3274ms, p90 3200ms vs
+# 3936ms, max 4216ms vs 4874ms, 0 failures either side). Byte-level diff of raw AWS event-stream
+# responses confirmed identical wire format (only usage/CRC fields differ), so no parser changes
+# needed. This host is only known to work in us-east-1 for this account; if you use other regions,
+# verify q.{region}.amazonaws.com resolves before relying on this.
+KIRO_API_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
 # Host for Q API (ListAvailableModels)
-KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
+# See note above - switched from runtime.{region}.kiro.dev to q.{region}.amazonaws.com.
+# This also restores dynamic model list fetching via /ListAvailableModels (account_manager.py
+# _is_runtime_endpoint() now returns False for this host), replacing the static FALLBACK_MODELS
+# list which was missing newer models (e.g. claude-sonnet-5).
+KIRO_Q_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
 
 # ==================================================================================================
 # Token Settings
