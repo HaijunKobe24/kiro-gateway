@@ -1884,3 +1884,60 @@ class TestAnthropicToKiroIntegration:
         print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+# ==================================================================================================
+# Tests for inline system message compatibility
+# ==================================================================================================
+
+
+class TestInlineSystemMessageCompatibility:
+    """Tests for system prompts embedded in Anthropic messages."""
+
+    def test_excludes_system_messages_from_unified_history(self):
+        """
+        What it does: Excludes system-role messages from unified conversation history.
+        Purpose: Prevent unsupported system roles from reaching the Kiro history builder.
+        """
+        messages = [
+            AnthropicMessage(role="system", content="Runtime instructions"),
+            AnthropicMessage(role="user", content="Hello"),
+        ]
+
+        result = convert_anthropic_messages(messages)
+
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].content == "Hello"
+
+    def test_merges_inline_and_top_level_system_prompts(self):
+        """
+        What it does: Merges inline and top-level system prompts into the request.
+        Purpose: Preserve both Claude Code system sources without creating system history.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-5",
+            messages=[
+                AnthropicMessage(role="user", content="Hello"),
+                AnthropicMessage(
+                    role="system",
+                    content=[{"type": "text", "text": "Inline instructions"}],
+                ),
+            ],
+            max_tokens=1024,
+            system="Top-level instructions",
+        )
+
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-inline-system", "arn:aws:test")
+
+        state = result["conversationState"]
+        current_content = state["currentMessage"]["userInputMessage"]["content"]
+
+        assert "Top-level instructions" in current_content
+        assert "Inline instructions" in current_content
+        assert state.get("history", []) == []

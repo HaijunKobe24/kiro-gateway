@@ -2519,3 +2519,32 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+
+# =============================================================================
+# Tests for Claude Code inline system role compatibility
+# =============================================================================
+
+
+class TestMessagesInlineSystemRoleCompatibility:
+    """Tests for system-role messages sent by Claude Code."""
+
+    def test_accepts_system_role_inside_messages(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Verifies messages with an inline system role pass validation.
+        Purpose: Prevent Claude Code Claude 5 requests from failing at the API boundary.
+        """
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-opus-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "system", "content": "Runtime instructions"},
+                ],
+            },
+        )
+
+        assert response.status_code != 422

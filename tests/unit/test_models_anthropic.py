@@ -1757,3 +1757,38 @@ class TestThinkingParameter:
         print(f"Comparing thinking: got={request.thinking}")
         assert request.thinking is not None
         assert request.thinking["type"] == "disabled"
+
+
+# ==================================================================================================
+# Tests for AnthropicMessage system role compatibility
+# ==================================================================================================
+
+
+class TestAnthropicMessageSystemRole:
+    """Tests for system-role messages emitted by Claude Code."""
+
+    def test_accepts_system_role(self):
+        """
+        What it does: Verifies that an Anthropic message can use the system role.
+        Purpose: Support Claude Code requests that embed system prompts in messages.
+        """
+        message = AnthropicMessage(
+            role="system",
+            content="Runtime system instructions",
+        )
+
+        assert message.role == "system"
+        assert message.content == "Runtime system instructions"
+
+    def test_accepts_system_role_content_blocks(self):
+        """
+        What it does: Verifies that system messages accept text content blocks.
+        Purpose: Preserve compatibility with block-based Anthropic system content.
+        """
+        message = AnthropicMessage(
+            role="system",
+            content=[{"type": "text", "text": "Runtime instructions"}],
+        )
+
+        assert message.role == "system"
+        assert len(message.content) == 1

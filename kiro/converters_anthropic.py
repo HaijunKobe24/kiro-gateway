@@ -113,6 +113,24 @@ def extract_system_prompt(system: Any) -> str:
     return str(system)
 
 
+def extract_system_prompt_from_messages(messages: List[AnthropicMessage]) -> str:
+    """
+    Extracts system prompt text from system-role messages.
+
+    Args:
+        messages: Anthropic messages that may contain system-role messages
+
+    Returns:
+        Combined system prompt text in message order
+    """
+    system_parts = [
+        extract_system_prompt(message.content)
+        for message in messages
+        if message.role == "system"
+    ]
+    return "\n".join(part for part in system_parts if part)
+
+
 def extract_tool_results_from_anthropic_content(content: Any) -> List[Dict[str, Any]]:
     """
     Extracts tool results from Anthropic message content.
@@ -265,6 +283,7 @@ def convert_anthropic_messages(
     - Text content (string or list of text blocks)
     - Tool use blocks (assistant messages)
     - Tool result blocks (user messages)
+    - System messages are extracted as the system prompt
 
     Args:
         messages: List of Anthropic messages
@@ -279,6 +298,9 @@ def convert_anthropic_messages(
     total_images = 0
 
     for msg in messages:
+        if msg.role == "system":
+            continue
+
         role = msg.role
         content = msg.content
 
@@ -435,7 +457,7 @@ def anthropic_to_kiro(
     This is the main entry point for Anthropic → Kiro conversion.
 
     Key differences from OpenAI:
-    - System prompt is a separate field (not in messages)
+    - System prompt may be a separate field or an embedded system-role message
     - Content can be string or list of content blocks
     - Tool format uses input_schema instead of parameters
 
@@ -450,15 +472,20 @@ def anthropic_to_kiro(
     Raises:
         ValueError: If there are no messages to send
     """
-    # Convert messages to unified format
+    # Extract system prompts from both supported Anthropic representations.
+    top_level_system_prompt = extract_system_prompt(request.system)
+    message_system_prompt = extract_system_prompt_from_messages(request.messages)
+    system_prompt = "\n".join(
+        prompt
+        for prompt in (top_level_system_prompt, message_system_prompt)
+        if prompt
+    )
+
+    # System-role messages are excluded by convert_anthropic_messages().
     unified_messages = convert_anthropic_messages(request.messages)
 
     # Convert tools to unified format
     unified_tools = convert_anthropic_tools(request.tools)
-
-    # System prompt is already separate in Anthropic format!
-    # It can be a string or list of content blocks (for prompt caching)
-    system_prompt = extract_system_prompt(request.system)
 
     # Get model ID for Kiro API (normalizes + resolves hidden models)
     # Pass-through principle: we normalize and send to Kiro, Kiro decides if valid
