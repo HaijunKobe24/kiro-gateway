@@ -1353,3 +1353,81 @@ class TestForwardModelRequestFieldsConfig:
         text = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
 
         assert "# FORWARD_MODEL_REQUEST_FIELDS=true" in text
+
+
+class TestFakeReasoningConfig:
+    """Tests for the FAKE_REASONING switch (tag injection is opt-in)."""
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self, monkeypatch):
+        """Reloads kiro.config with the real environment after each test."""
+        yield
+        monkeypatch.undo()
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+    @staticmethod
+    def _reload(monkeypatch, value):
+        """
+        Reloads kiro.config with FAKE_REASONING set (or removed) and without reading .env.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture
+            value: Value for FAKE_REASONING (None removes the variable)
+
+        Returns:
+            The reloaded kiro.config module
+        """
+        from importlib import reload
+        import dotenv
+        import kiro.config as config_module
+
+        # The local .env must not influence the result (it may set FAKE_REASONING itself)
+        monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
+        if value is None:
+            monkeypatch.delenv("FAKE_REASONING", raising=False)
+        else:
+            monkeypatch.setenv("FAKE_REASONING", value)
+        return reload(config_module)
+
+    def test_default_is_disabled(self, monkeypatch):
+        """
+        What it does: Removes the variable and reloads the config.
+        Purpose: Native reasoning is parsed always; the text-tag injection must be opt-in because
+        it was observed to make the upstream return empty or reasoning-only responses.
+        """
+        config_module = self._reload(monkeypatch, None)
+
+        assert config_module.FAKE_REASONING_ENABLED is False
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "on", "enabled", " true ", "\ttrue\n"])
+    def test_explicit_truthy_values_enable(self, monkeypatch, raw):
+        """
+        What it does: Each accepted truthy spelling, also padded with whitespace.
+        Purpose: Opting in works regardless of case and surrounding whitespace.
+        """
+        config_module = self._reload(monkeypatch, raw)
+
+        assert config_module.FAKE_REASONING_ENABLED is True
+
+    @pytest.mark.parametrize("raw", ["", " ", "false", "FALSE", "0", "no", "off", "disabled", "maybe", "ture", "2", "truee"])
+    def test_everything_else_stays_disabled(self, monkeypatch, raw):
+        """
+        What it does: Falsy values, empty strings and typos.
+        Purpose: Only an explicit truthy value enables the injection; a typo never turns it on.
+        """
+        config_module = self._reload(monkeypatch, raw)
+
+        assert config_module.FAKE_REASONING_ENABLED is False
+
+    def test_env_example_documents_the_new_default(self):
+        """
+        What it does: Reads .env.example (the committed template, never .env).
+        Purpose: The template must say the default is disabled and show how to enable it.
+        """
+        from pathlib import Path
+        text = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
+
+        assert "# FAKE_REASONING=true" in text
+        assert "Default: false (DISABLED)" in text

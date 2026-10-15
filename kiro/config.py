@@ -588,12 +588,16 @@ def _warn_timeout_configuration():
 # WHY "FAKE"? This is NOT native extended thinking API support. Instead, we inject
 # <thinking_mode>enabled</thinking_mode> tags into the prompt, and the model responds
 # with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
-# It works great, but it's a hack - hence "fake" reasoning.
+# It is a hack - hence "fake" reasoning.
 #
-# Default: true (enabled) - provides premium experience out of the box
-_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
-# Default is True - if env var is not set or empty, enable fake reasoning
-FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+# Default: false (disabled). Models such as claude-sonnet-5.5 reason natively and Kiro streams
+# that reasoning as reasoningContentEvent frames, which are always parsed. Injecting the text
+# tags on top of that was observed to make the upstream deterministically return an empty
+# response (or end the stream right after the reasoning) for some requests.
+# Set FAKE_REASONING=true to restore the tag injection (e.g. for models without native reasoning).
+_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").strip().lower()
+# Default is False - only an explicit truthy value enables the tag injection
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW in ("true", "1", "yes", "enabled", "on")
 
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
