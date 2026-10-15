@@ -1357,3 +1357,533 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+# ==================================================================================================
+# Native reasoning (reasoningContentEvent) tests
+# ==================================================================================================
+
+SECRET_MARKER = "SECRET_REASONING_MARKER_7f3a"
+
+
+def _parse_chunks(chunks):
+    """Feeds chunks to a fresh parser and returns (parser, all events)."""
+    parser = AwsEventStreamParser()
+    events = []
+    for chunk in chunks:
+        events.extend(parser.feed(chunk))
+    return parser, events
+
+
+def _types(events):
+    """Returns the list of event types."""
+    return [e["type"] for e in events]
+
+
+def _reasoning_texts(events):
+    """Returns the data of all reasoning events."""
+    return [e["data"] for e in events if e["type"] == "reasoning"]
+
+
+class TestAwsFrameBuilderFixture:
+    """Golden tests that pin the aws_frames fixture to real captured Kiro bytes."""
+
+    def test_first_real_reasoning_frame_matches_capture(self, aws_frames):
+        """
+        What it does: Builds the reasoning frame for text "I" and compares to captured bytes.
+        Goal: Prove the fixture produces byte-identical frames to real Kiro traffic.
+        """
+        print("Action: Building reasoning frame for 'I'...")
+        frame = aws_frames.reasoning("I")
+
+        print(f"Comparing: {frame.hex()[:40]}...")
+        assert frame.hex() == aws_frames.SAMPLE_FIRST_REASONING_FRAME_HEX
+
+    def test_total_length_field_equals_frame_length(self, aws_frames):
+        """
+        What it does: Checks the big-endian total-length prelude field for several payloads.
+        Goal: Frames must be structurally valid for any payload size.
+        """
+        import struct
+
+        for frame in (
+            aws_frames.reasoning(""),
+            aws_frames.reasoning("中文 😀 —"),
+            aws_frames.content("x" * 1000),
+            aws_frames.build("customEvent", b""),
+        ):
+            total = struct.unpack(">I", frame[:4])[0]
+            print(f"Frame length {len(frame)}, prelude says {total}")
+            assert total == len(frame)
+
+    def test_split_reassembles_to_original(self, aws_frames):
+        """
+        What it does: Splits a stream with cycled sizes and joins it back.
+        Goal: split() must be lossless and never emit empty chunks.
+        """
+        data = aws_frames.reasoning("abc") + aws_frames.content("def")
+        chunks = aws_frames.split(data, [1, 5, 3])
+        assert b"".join(chunks) == data
+        assert all(chunks)
+
+
+class TestAwsEventStreamParserReasoningEvents:
+    """Tests for recognizing {"text": ...} reasoning frames."""
+
+    def test_event_patterns_keep_legacy_entries_and_add_reasoning(self):
+        """
+        What it does: Pins EVENT_PATTERNS.
+        Goal: The seven legacy patterns keep order/content; reasoning patterns are appended.
+        """
+        patterns = AwsEventStreamParser.EVENT_PATTERNS
+        assert patterns[:7] == [
+            ('{"content":', 'content'),
+            ('{"name":', 'tool_start'),
+            ('{"input":', 'tool_input'),
+            ('{"stop":', 'tool_stop'),
+            ('{"followupPrompt":', 'followup'),
+            ('{"usage":', 'usage'),
+            ('{"contextUsagePercentage":', 'context_usage'),
+        ]
+        assert ('{"text":', 'reasoning') in patterns
+        assert ('{"signature":', 'reasoning_signature') in patterns
+
+    def test_bare_json_reasoning_event(self):
+        """
+        What it does: Feeds bare JSON {"text":"hello"}.
+        Goal: Emits exactly one reasoning event.
+        """
+        _, events = _parse_chunks([b'{"text":"hello"}'])
+        print(f"Events: {events}")
+        assert events == [{"type": "reasoning", "data": "hello"}]
+
+    def test_real_aws_frame_reasoning_event(self, aws_frames):
+        """
+        What it does: Feeds a full AWS frame (headers + CRC) carrying reasoning text.
+        Goal: Binary framing around the JSON must not prevent recognition.
+        """
+        _, events = _parse_chunks([aws_frames.reasoning("I")])
+        assert events == [{"type": "reasoning", "data": "I"}]
+
+    def test_fifty_frames_in_one_chunk_keep_order(self, aws_frames):
+        """
+        What it does: Puts 50 reasoning frames in a single chunk.
+        Goal: All 50 events are returned in order with exact text.
+        """
+        texts = [f"t{i}" for i in range(50)]
+        data = b"".join(aws_frames.reasoning(t) for t in texts)
+
+        _, events = _parse_chunks([data])
+
+        assert _reasoning_texts(events) == texts
+        assert len(events) == 50
+
+    def test_interleaved_stream_event_sequence_and_tool_calls(self, aws_frames):
+        """
+        What it does: Interleaves reasoning with content, tool, usage and context frames.
+        Goal: Exact event sequence; tool call assembly must be unaffected by reasoning frames.
+        """
+        data = b"".join([
+            aws_frames.reasoning("think 1"),
+            aws_frames.signature("QUJD"),
+            aws_frames.content("answer"),
+            aws_frames.tool_start("Bash", "toolu_1"),
+            aws_frames.reasoning("think between tool frames"),
+            aws_frames.tool_input('{"command"', "Bash", "toolu_1"),
+            aws_frames.reasoning("think 3"),
+            aws_frames.tool_input(': "ls"}', "Bash", "toolu_1"),
+            aws_frames.tool_stop("Bash", "toolu_1"),
+            aws_frames.build("usageEvent", {"usage": 0.5}),
+            aws_frames.context_usage(12.5),
+            aws_frames.reasoning("think 4"),
+        ])
+
+        parser, events = _parse_chunks([data])
+        print(f"Types: {_types(events)}")
+
+        assert _types(events) == [
+            "reasoning", "reasoning_signature", "content",
+            "reasoning", "reasoning",
+            "usage", "context_usage", "reasoning",
+        ]
+        tool_calls = parser.get_tool_calls()
+        assert len(tool_calls) == 1
+        assert tool_calls[0]["function"]["name"] == "Bash"
+        assert tool_calls[0]["function"]["arguments"] == '{"command": "ls"}'
+
+    def test_reasoning_does_not_affect_content_deduplication(self, aws_frames):
+        """
+        What it does: content "A" -> reasoning "A" -> content "A".
+        Goal: The second content is still deduplicated; last_content is not overwritten.
+        """
+        data = (
+            aws_frames.content("A") + aws_frames.reasoning("A") + aws_frames.content("A")
+        )
+
+        parser, events = _parse_chunks([data])
+
+        assert _types(events) == ["content", "reasoning"]
+        assert parser.last_content == "A"
+
+    def test_reasoning_between_equal_contents_keeps_dedup_state(self):
+        """
+        What it does: content "X", reasoning "Y", content "X" as bare JSON.
+        Goal: Reasoning must not reset the dedup state (last_content stays "X").
+        """
+        parser, events = _parse_chunks([b'{"content":"X"}{"text":"Y"}{"content":"X"}'])
+        assert _types(events) == ["content", "reasoning"]
+        assert parser.last_content == "X"
+
+    def test_identical_consecutive_reasoning_texts_are_not_deduplicated(self, aws_frames):
+        """
+        What it does: Two consecutive reasoning frames with the same text.
+        Goal: Both are emitted - repeated tokens are legitimate text.
+        """
+        data = aws_frames.reasoning("the") + aws_frames.reasoning("the")
+        _, events = _parse_chunks([data])
+        assert _reasoning_texts(events) == ["the", "the"]
+
+    def test_reset_clears_partial_frame_and_pending_utf8_bytes(self):
+        """
+        What it does: Feeds half a frame plus half a multi-byte char, resets, feeds a new frame.
+        Goal: No leftovers from the old stream leak into the new one.
+        """
+        parser = AwsEventStreamParser()
+        raw = '{"text":"中"}'.encode("utf-8")
+        assert parser.feed(raw[:11]) == []  # cut inside the 3-byte char
+        parser.reset()
+
+        events = parser.feed(b'{"text":"fresh"}')
+
+        assert events == [{"type": "reasoning", "data": "fresh"}]
+        assert parser.buffer == ""
+
+    def test_reasoning_events_do_not_create_tool_state(self, aws_frames):
+        """
+        What it does: Feeds only reasoning frames.
+        Goal: No tool state is created.
+        """
+        parser, _ = _parse_chunks([aws_frames.reasoning("a") + aws_frames.signature("sig")])
+        assert parser.current_tool_call is None
+        assert parser.get_tool_calls() == []
+
+
+class TestAwsEventStreamParserReasoningChunking:
+    """Chunk-boundary robustness for reasoning frames."""
+
+    @staticmethod
+    def _stream(aws_frames):
+        """A realistic stream with multi-byte characters in every reasoning frame."""
+        return b"".join([
+            aws_frames.reasoning("中文推理"),
+            aws_frames.reasoning(" 😀 — dash"),
+            aws_frames.signature("QUJD" * 20),
+            aws_frames.content("正文 ✓"),
+            aws_frames.context_usage(3.5),
+        ])
+
+    def test_split_at_every_byte_offset_equals_whole(self, aws_frames):
+        """
+        What it does: Splits the stream in two at EVERY byte offset.
+        Goal: Event list is identical to feeding it whole (covers cuts inside prefixes,
+        headers, CRC and multi-byte characters).
+        """
+        data = self._stream(aws_frames)
+        _, expected = _parse_chunks([data])
+        assert _reasoning_texts(expected) == ["中文推理", " 😀 — dash"]
+
+        for cut in range(1, len(data)):
+            _, events = _parse_chunks([data[:cut], data[cut:]])
+            assert events == expected, f"mismatch when cutting at byte {cut}"
+
+    def test_byte_by_byte_feed_equals_whole(self, aws_frames):
+        """
+        What it does: Feeds the stream one byte at a time.
+        Goal: Same events as the whole-stream feed.
+        """
+        data = self._stream(aws_frames)
+        _, expected = _parse_chunks([data])
+
+        _, events = _parse_chunks([data[i:i + 1] for i in range(len(data))])
+
+        assert events == expected
+
+    def test_seeded_random_chunking_equals_whole(self, aws_frames):
+        """
+        What it does: 50 deterministic random chunkings.
+        Goal: Same events regardless of chunk sizes.
+        """
+        import random
+
+        data = self._stream(aws_frames)
+        _, expected = _parse_chunks([data])
+        for seed in range(50):
+            rnd = random.Random(seed)
+            sizes = [rnd.randint(1, 40) for _ in range(rnd.randint(1, 10))]
+            _, events = _parse_chunks(aws_frames.split(data, sizes))
+            assert events == expected, f"mismatch for seed {seed}"
+
+    def test_hypothesis_arbitrary_chunk_sizes_equal_whole(self, aws_frames):
+        """
+        What it does: Property test over arbitrary chunk-size sequences.
+        Goal: Chunking never changes the parsed events.
+        """
+        from hypothesis import HealthCheck, given, settings, strategies as st
+
+        data = self._stream(aws_frames)
+        _, expected = _parse_chunks([data])
+
+        @settings(max_examples=50, deadline=None, suppress_health_check=list(HealthCheck))
+        @given(st.lists(st.integers(min_value=1, max_value=64), min_size=1))
+        def check(sizes):
+            _, events = _parse_chunks(aws_frames.split(data, sizes))
+            assert events == expected
+
+        check()
+
+    @pytest.mark.parametrize("char", ["中", "😀", "—"])
+    def test_multibyte_character_split_inside_is_not_lost(self, char):
+        """
+        What it does: Cuts the raw JSON at every byte inside a 2-4 byte character.
+        Goal: The character survives (incremental UTF-8 decoding). Without it, the
+        character is silently dropped.
+        """
+        raw = f'{{"text":"ab{char}cd"}}'.encode("utf-8")
+        start = raw.index(char.encode("utf-8"))
+        for cut in range(start + 1, start + len(char.encode("utf-8"))):
+            _, events = _parse_chunks([raw[:cut], raw[cut:]])
+            assert events == [{"type": "reasoning", "data": f"ab{char}cd"}], f"cut at {cut}"
+
+    def test_pattern_prefix_split_across_chunks(self):
+        """
+        What it does: Splits bare JSON inside the '{"text":' prefix.
+        Goal: Prefix is matched once the rest arrives.
+        """
+        parser = AwsEventStreamParser()
+        assert parser.feed(b'{"te') == []
+        events = parser.feed(b'xt":"a"}')
+        assert events == [{"type": "reasoning", "data": "a"}]
+
+    def test_signature_split_across_three_chunks(self, aws_frames):
+        """
+        What it does: Splits a long signature frame in 3 pieces.
+        Goal: One signature event with the full length.
+        """
+        sig = "QUJD" * 300
+        frame = aws_frames.signature(sig)
+        third = len(frame) // 3
+
+        _, events = _parse_chunks([frame[:third], frame[third:2 * third], frame[2 * third:]])
+
+        assert events == [{"type": "reasoning_signature", "data": len(sig)}]
+
+
+class TestAwsEventStreamParserReasoningEdgeCases:
+    """Malformed, hostile and unusual reasoning payloads."""
+
+    def test_empty_text_emits_nothing_and_next_frame_works(self, aws_frames):
+        """
+        What it does: Empty text frame followed by a normal one.
+        Goal: No event for the empty text; parsing continues.
+        """
+        _, events = _parse_chunks([aws_frames.reasoning("") + aws_frames.reasoning("x")])
+        assert events == [{"type": "reasoning", "data": "x"}]
+
+    def test_escape_sequences_are_decoded(self, aws_frames):
+        """
+        What it does: Text with \\n \\t \\" \\\\ \\/ escapes.
+        Goal: JSON escapes are decoded exactly.
+        """
+        text = 'line1\nline2\t"quoted" back\\slash /slash'
+        _, events = _parse_chunks([aws_frames.reasoning(text)])
+        assert _reasoning_texts(events) == [text]
+
+    def test_unicode_escapes_and_surrogate_pairs(self, aws_frames):
+        """
+        What it does: Payload using \\u4e2d and the surrogate pair \\ud83d\\ude00.
+        Goal: Decoded to 中 and 😀.
+        """
+        payload = b'{"text":"\\u4e2d\\ud83d\\ude00"}'
+        _, events = _parse_chunks([aws_frames.build("reasoningContentEvent", payload)])
+        assert _reasoning_texts(events) == ["中😀"]
+
+    def test_raw_utf8_chinese_emoji_and_em_dash(self, aws_frames):
+        """
+        What it does: Raw (non-escaped) UTF-8 text.
+        Goal: Preserved byte-exactly.
+        """
+        text = "中文推理 😀 — end"
+        _, events = _parse_chunks([aws_frames.reasoning(text)])
+        assert _reasoning_texts(events) == [text]
+
+    def test_braces_and_brackets_inside_text(self, aws_frames):
+        """
+        What it does: Text containing { } [ ] and unbalanced braces.
+        Goal: Brace matching respects JSON strings; one event only.
+        """
+        text = 'a { b } [ c ] } { "'
+        _, events = _parse_chunks([aws_frames.reasoning(text) + aws_frames.reasoning("next")])
+        assert _reasoning_texts(events) == [text, "next"]
+
+    @pytest.mark.parametrize("text", [
+        '{"content":"x"}',
+        '{"name":"y"}',
+        '{"text":"z"}',
+        '{"stop":true}',
+        '{"usage":1}',
+        '{"input":"i"}',
+        '{"contextUsagePercentage":9}',
+    ])
+    def test_text_that_looks_like_other_frames_creates_no_phantom_events(self, aws_frames, text):
+        """
+        What it does: Reasoning text that quotes another frame's JSON.
+        Goal: Exactly one reasoning event; no content/tool/usage events; no tool state.
+        """
+        parser, events = _parse_chunks([aws_frames.reasoning(text)])
+        print(f"Events: {events}")
+        assert events == [{"type": "reasoning", "data": text}]
+        assert parser.current_tool_call is None
+
+    def test_content_containing_escaped_text_json_stays_content(self, aws_frames):
+        """
+        What it does: Content whose text is '{"text":"x"}'.
+        Goal: Stays a content event - never misread as reasoning.
+        """
+        _, events = _parse_chunks([aws_frames.content('{"text":"x"}')])
+        assert events == [{"type": "content", "data": '{"text":"x"}'}]
+
+    @pytest.mark.parametrize("payload", [
+        b'{"text":123}', b'{"text":null}', b'{"text":true}', b'{"text":[]}', b'{"text":{}}',
+        b'{"text":{"a":"b"}}', b'{"text":1.5}',
+    ])
+    def test_non_string_text_is_ignored(self, payload):
+        """
+        What it does: Non-string "text" values.
+        Goal: No event, no exception, next frame still parsed.
+        """
+        _, events = _parse_chunks([payload + b'{"text":"ok"}'])
+        assert events == [{"type": "reasoning", "data": "ok"}]
+
+    def test_invalid_json_is_skipped_and_never_logged_verbatim(self, loguru_messages):
+        """
+        What it does: Malformed reasoning JSON carrying a secret marker, then a valid frame.
+        Goal: No crash, valid frame still parsed, the logs contain the length but never the text.
+        """
+        bad = f'{{"text":"{SECRET_MARKER}" oops}}'.encode()
+        _, events = _parse_chunks([bad + b'{"text":"fine"}'])
+
+        assert events == [{"type": "reasoning", "data": "fine"}]
+        joined = "\n".join(loguru_messages)
+        print(f"Logs: {joined}")
+        assert SECRET_MARKER not in joined
+        assert "length=" in joined
+
+    def test_invalid_escape_is_skipped_and_never_logged_verbatim(self, loguru_messages):
+        """
+        What it does: Reasoning JSON with an invalid escape sequence.
+        Goal: Skipped without leaking text into logs.
+        """
+        bad = f'{{"text":"{SECRET_MARKER}\\q"}}'.encode()
+        _, events = _parse_chunks([bad + b'{"text":"after"}'])
+        assert events == [{"type": "reasoning", "data": "after"}]
+        assert SECRET_MARKER not in "\n".join(loguru_messages)
+
+    def test_invalid_signature_json_is_not_logged_verbatim(self, loguru_messages):
+        """
+        What it does: Malformed signature JSON.
+        Goal: Treated like reasoning text for log safety.
+        """
+        bad = f'{{"signature":"{SECRET_MARKER}" oops}}'.encode()
+        _, events = _parse_chunks([bad])
+        assert events == []
+        assert SECRET_MARKER not in "\n".join(loguru_messages)
+
+    def test_non_string_text_log_has_type_only(self, loguru_messages):
+        """
+        What it does: Non-string text.
+        Goal: Debug log mentions the type name, not the value.
+        """
+        _parse_chunks([b'{"text":123456789}'])
+        joined = "\n".join(loguru_messages)
+        assert "int" in joined
+        assert "123456789" not in joined
+
+    def test_noise_between_frames_is_ignored(self, aws_frames):
+        """
+        What it does: Garbage bytes between frames.
+        Goal: Frames around the noise are still parsed.
+        """
+        data = aws_frames.reasoning("a") + b"\xff\xfe\x00" + aws_frames.reasoning("b")
+        _, events = _parse_chunks([data])
+        assert _reasoning_texts(events) == ["a", "b"]
+
+    def test_dangling_utf8_lead_byte_before_frame_does_not_swallow_it(self, aws_frames):
+        """
+        What it does: A UTF-8 lead byte (like a CRC byte could be) right before the next frame.
+        Goal: The next frame is parsed - the pending-bytes decoder must not eat it.
+        """
+        for lead in (b"\xe4", b"\xf0", b"\xc3"):
+            _, events = _parse_chunks([aws_frames.reasoning("a") + lead, aws_frames.reasoning("b")])
+            assert _reasoning_texts(events) == ["a", "b"], f"lead byte {lead!r}"
+
+        _, events = _parse_chunks([b"\xe4", b'{"text":"x"}'])
+        assert _reasoning_texts(events) == ["x"]
+
+    def test_huge_frame_single_chunk_and_multi_chunk(self, aws_frames):
+        """
+        What it does: 200KB reasoning frame fed whole and in 64KB chunks.
+        Goal: Parsed in both cases without loss.
+        """
+        text = ("长" * 3000 + "x" * 197000)
+        frame = aws_frames.reasoning(text) + aws_frames.reasoning("tail")
+
+        _, whole = _parse_chunks([frame])
+        _, chunked = _parse_chunks(aws_frames.split(frame, [65536]))
+
+        assert _reasoning_texts(whole) == [text, "tail"]
+        assert _reasoning_texts(chunked) == [text, "tail"]
+
+    def test_signature_event_reports_length_only(self, aws_frames):
+        """
+        What it does: Signature frame.
+        Goal: Emits reasoning_signature with len(signature); not a reasoning text event.
+        """
+        sig = "QUJD" * 50
+        _, events = _parse_chunks([aws_frames.signature(sig)])
+        assert events == [{"type": "reasoning_signature", "data": len(sig)}]
+
+    @pytest.mark.parametrize("payload", [b'{"signature":""}', b'{"signature":123}', b'{"signature":null}'])
+    def test_empty_or_non_string_signature_reports_zero(self, payload):
+        """
+        What it does: Empty / non-string signatures.
+        Goal: data == 0 and no exception.
+        """
+        _, events = _parse_chunks([payload])
+        assert events == [{"type": "reasoning_signature", "data": 0}]
+
+    def test_unknown_first_key_frame_is_still_ignored(self, aws_frames):
+        """
+        What it does: Frame whose first key is unknown.
+        Goal: Ignored exactly as before; neighbours unaffected.
+        """
+        data = aws_frames.build("weirdEvent", {"foo": 1}) + aws_frames.reasoning("ok")
+        _, events = _parse_chunks([data])
+        assert events == [{"type": "reasoning", "data": "ok"}]
+
+    def test_real_shaped_stream_counts_and_order(self, aws_frames):
+        """
+        What it does: Reasoning x40 -> signature -> content x10 -> context usage -> metering.
+        Goal: Matches the shape of real Kiro captures (metering is not parsed - unchanged).
+        """
+        data = b"".join(
+            [aws_frames.reasoning(f"r{i}") for i in range(40)]
+            + [aws_frames.signature("QUJD")]
+            + [aws_frames.content(f"c{i}") for i in range(10)]
+            + [aws_frames.context_usage(7.0), aws_frames.metering(0.7)]
+        )
+
+        _, events = _parse_chunks([data])
+
+        assert _types(events) == (
+            ["reasoning"] * 40 + ["reasoning_signature"] + ["content"] * 10 + ["context_usage"]
+        )

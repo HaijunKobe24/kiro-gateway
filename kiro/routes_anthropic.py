@@ -25,6 +25,7 @@ Contains the /v1/messages endpoint compatible with Anthropic's Messages API.
 Reference: https://docs.anthropic.com/en/api/messages
 """
 
+import asyncio
 import json
 from typing import Optional
 
@@ -50,6 +51,9 @@ from kiro.streaming_anthropic import (
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
 )
+from kiro.streaming_core import aclose_shielded, prime_sse_stream
+from kiro.upstream_guard import EmptyUpstreamResponseError
+from kiro.empty_response import build_empty_response_context, handle_empty_response_anthropic
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
@@ -383,7 +387,8 @@ async def messages(
                 kiro_payload = anthropic_to_kiro(
                     request_data,
                     conversation_id,
-                    profile_arn_for_payload
+                    profile_arn_for_payload,
+                    model_cache=model_cache
                 )
             except ValueError as e:
                 logger.error(f"Conversion error: {e}")
@@ -434,30 +439,39 @@ async def messages(
                 )
                 
                 if response.status_code == 200:
-                    # SUCCESS - report and return
-                    await account_manager.report_success(account.id, request_data.model)
-                    
+                    # HTTP 200 - the account is reported as healthy only after the response
+                    # proved to be non-empty (an empty upstream response says nothing about
+                    # the account and must not count for or against it).
                     if request_data.stream:
                         # Streaming mode
+                        async def make_retry_request():
+                            return await http_client.request_with_retry(
+                                "POST", url, kiro_payload, stream=True
+                            )
+                        
+                        # Wait for the upstream to prove it is not empty BEFORE the
+                        # StreamingResponse is built, so an empty response can still
+                        # be answered with a proper HTTP error status
+                        sse_stream = await prime_sse_stream(
+                            stream_with_first_token_retry_anthropic(
+                                make_request=make_retry_request,
+                                model=request_data.model,
+                                model_cache=model_cache,
+                                auth_manager=auth_manager,
+                                initial_response=response,
+                                request_messages=messages_for_tokenizer,
+                                request_tools=tools_for_tokenizer,
+                                request_system=system_for_tokenizer,
+                                emit_ready_marker=True,
+                            )
+                        )
+                        await account_manager.report_success(account.id, request_data.model)
+                        
                         async def stream_wrapper():
                             streaming_error = None
                             client_disconnected = False
                             try:
-                                async def make_retry_request():
-                                    return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
-                                    )
-                                
-                                async for chunk in stream_with_first_token_retry_anthropic(
-                                    make_request=make_retry_request,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer,
-                                    request_system=system_for_tokenizer,
-                                ):
+                                async for chunk in sse_stream:
                                     yield chunk
                             except GeneratorExit:
                                 client_disconnected = True
@@ -506,6 +520,7 @@ async def messages(
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
                         )
+                        await account_manager.report_success(account.id, request_data.model)
                         
                         await http_client.close()
                         logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
@@ -578,6 +593,23 @@ async def messages(
                         
                         continue  # Next iteration
             
+            except asyncio.CancelledError:
+                # Client went away while waiting for the upstream or collecting the response:
+                # close the upstream connection (shielded from further cancellation)
+                await aclose_shielded(http_client.close)
+                raise
+            except EmptyUpstreamResponseError as e:
+                # Not an account problem: no report_failure (no circuit breaker), no failover
+                # (switching account and resending would be a gateway-side retry).
+                # The client gets an explicit error and decides whether to retry.
+                await http_client.close()
+                return handle_empty_response_anthropic(
+                    e,
+                    build_empty_response_context(
+                        request_data.model, bool(request_data.stream), kiro_payload,
+                        messages_for_tokenizer, tools_for_tokenizer, system_for_tokenizer,
+                    ),
+                )
             except HTTPException as e:
                 await http_client.close()
                 
@@ -691,7 +723,8 @@ async def messages(
         kiro_payload = anthropic_to_kiro(
             request_data,
             conversation_id,
-            profile_arn_for_payload
+            profile_arn_for_payload,
+            model_cache=model_cache
         )
     except ValueError as e:
         logger.error(f"Conversion error: {e}")
@@ -795,27 +828,33 @@ async def messages(
         
         if request_data.stream:
             # Streaming mode with first token retry
+            # Create retry request function for retries
+            async def make_retry_request():
+                return await http_client.request_with_retry(
+                    "POST", url, kiro_payload, stream=True
+                )
+            
+            # Wait for the upstream to prove it is not empty BEFORE the StreamingResponse
+            # is built, so an empty response can still be answered with an HTTP error status
+            sse_stream = await prime_sse_stream(
+                stream_with_first_token_retry_anthropic(
+                    make_request=make_retry_request,
+                    model=request_data.model,
+                    model_cache=model_cache,
+                    auth_manager=auth_manager,
+                    initial_response=response,
+                    request_messages=messages_for_tokenizer,
+                    request_tools=tools_for_tokenizer,
+                    request_system=system_for_tokenizer,
+                    emit_ready_marker=True,
+                )
+            )
+            
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
                 try:
-                    # Create retry request function for retries
-                    async def make_retry_request():
-                        return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
-                        )
-                    
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry_anthropic(
-                        make_request=make_retry_request,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer,
-                        request_system=system_for_tokenizer,
-                    ):
+                    async for chunk in sse_stream:
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -875,6 +914,20 @@ async def messages(
             
             return JSONResponse(content=anthropic_response)
     
+    except asyncio.CancelledError:
+        # Client went away while waiting for the upstream or collecting the response:
+        # close the upstream connection (shielded from further cancellation)
+        await aclose_shielded(http_client.close)
+        raise
+    except EmptyUpstreamResponseError as e:
+        await http_client.close()
+        return handle_empty_response_anthropic(
+            e,
+            build_empty_response_context(
+                request_data.model, bool(request_data.stream), kiro_payload,
+                messages_for_tokenizer, tools_for_tokenizer, system_for_tokenizer,
+            ),
+        )
     except HTTPException as e:
         await http_client.close()
         

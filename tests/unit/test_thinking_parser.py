@@ -990,3 +990,72 @@ class TestInjectThinkingTags:
         print(f"Result ends with original: {result.endswith(original)}")
         assert result.endswith(original)
         
+
+
+# ==================================================================================================
+# Tests for format_native_reasoning (native reasoningContentEvent handling)
+# ==================================================================================================
+
+class TestFormatNativeReasoning:
+    """Tests for format_native_reasoning() - FAKE_REASONING_HANDLING for tag-less reasoning."""
+
+    @pytest.mark.parametrize("mode", ["as_reasoning_content", "strip_tags", "pass", "include_as_text", "totally-unknown"])
+    def test_non_remove_modes_return_text_unchanged(self, mode):
+        """
+        What it does: Applies every non-remove mode (plus unknown values).
+        Goal: Native reasoning has no tags, so the text is returned verbatim.
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        assert format_native_reasoning("some reasoning", mode) == "some reasoning"
+
+    def test_remove_mode_discards(self):
+        """
+        What it does: Applies "remove".
+        Goal: The chunk is discarded (None).
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        assert format_native_reasoning("some reasoning", "remove") is None
+
+    @pytest.mark.parametrize("text", [None, ""])
+    @pytest.mark.parametrize("mode", ["as_reasoning_content", "remove", "pass", "strip_tags", None])
+    def test_empty_or_none_text_returns_none_in_every_mode(self, text, mode):
+        """
+        What it does: Empty / None text in every mode.
+        Goal: Nothing to emit -> None.
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        assert format_native_reasoning(text, mode) is None
+
+    @pytest.mark.parametrize("text", ["  a\n", "\n\n", " ", "中文 😀 — x", "\ttabbed"])
+    def test_text_is_never_stripped_or_rewritten(self, text):
+        """
+        What it does: Whitespace-only, padded, multi-line and unicode text.
+        Goal: Preserved byte-for-byte (whitespace is significant in streamed chunks).
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        assert format_native_reasoning(text, "as_reasoning_content") == text
+
+    def test_default_mode_comes_from_config(self):
+        """
+        What it does: Omits the mode and patches the module-level FAKE_REASONING_HANDLING.
+        Goal: Falls back to the configured handling mode.
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        with patch("kiro.thinking_parser.FAKE_REASONING_HANDLING", "remove"):
+            assert format_native_reasoning("x") is None
+        with patch("kiro.thinking_parser.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+            assert format_native_reasoning("x") == "x"
+
+    def test_does_not_depend_on_thinking_parser_instance_state(self):
+        """
+        What it does: Calls the function without any ThinkingParser.
+        Goal: Native reasoning works when FAKE_REASONING is disabled (no parser instance).
+        """
+        from kiro.thinking_parser import format_native_reasoning
+
+        assert format_native_reasoning("abc", "pass") == "abc"

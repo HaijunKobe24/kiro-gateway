@@ -32,7 +32,7 @@ with connection pooling for better resource management.
 
 import asyncio
 import json
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -40,8 +40,57 @@ from loguru import logger
 
 from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
+from kiro.model_request_fields import ADDITIONAL_FIELDS_KEY
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
+
+
+# Markers in a Kiro HTTP 400 body that point at the additionalModelRequestFields object.
+REJECTED_FIELDS_MARKERS: Tuple[str, ...] = (ADDITIONAL_FIELDS_KEY, "REQUEST_BODY_INVALID")
+
+# Maximum number of characters of the Kiro error message written to the log.
+MAX_LOGGED_ERROR_CHARS: int = 200
+
+
+def is_rejected_extra_fields(response_body: bytes) -> bool:
+    """
+    Decide whether an HTTP 400 body complains about additionalModelRequestFields.
+
+    The generic "Improperly formed request" text is deliberately NOT a marker: it covers many
+    unrelated validation problems (tool names, message order, ...).
+
+    Args:
+        response_body: Raw body of the 400 response
+
+    Returns:
+        True when the body contains "additionalModelRequestFields" or "REQUEST_BODY_INVALID"
+    """
+    text = response_body.decode("utf-8", errors="replace")
+    return any(marker in text for marker in REJECTED_FIELDS_MARKERS)
+
+
+def describe_kiro_error(response_body: bytes) -> str:
+    """
+    Build a short, log-safe description of a Kiro error body.
+
+    Only the Kiro "reason" and "message" are reported (truncated); the request body is never
+    part of it. A body that is not a JSON object is reported by its length only.
+
+    Args:
+        response_body: Raw body of the error response
+
+    Returns:
+        e.g. "reason=REQUEST_BODY_INVALID, message=..." or "non-JSON body of 12 bytes"
+    """
+    try:
+        data = json.loads(response_body.decode("utf-8", errors="replace"))
+    except ValueError:
+        return f"non-JSON body of {len(response_body)} bytes"
+    if not isinstance(data, dict):
+        return f"non-object JSON body of {len(response_body)} bytes"
+    reason = str(data.get("reason"))[:MAX_LOGGED_ERROR_CHARS]
+    message = str(data.get("message"))[:MAX_LOGGED_ERROR_CHARS]
+    return f"reason={reason!r}, message={message!r}"
 
 
 class KiroHttpClient:
@@ -168,6 +217,56 @@ class KiroHttpClient:
                 logger.warning(f"Error closing HTTP client: {e}")
     
     async def request_with_retry(
+        self,
+        method: str,
+        url: str,
+        json_data: Optional[dict] = None,
+        params: Optional[dict] = None,
+        stream: bool = False
+    ) -> httpx.Response:
+        """
+        Executes an HTTP request with retry logic and the additionalModelRequestFields fallback.
+
+        Runs the regular retry logic (see _request_with_retry_once). If the final response is an
+        HTTP 400 that complains about additionalModelRequestFields (and this request carried
+        that field), the field is removed from json_data IN PLACE and the request is sent exactly
+        once more. In-place removal matters because the streaming first-token retry reuses the
+        same payload object. The second response, whatever it is, is returned unchanged.
+        The 400 is consumed here, so callers never classify it as an account failure.
+
+        Args:
+            method: HTTP method (GET, POST, etc.)
+            url: Request URL
+            json_data: Optional JSON body (for POST/PUT/PATCH)
+            params: Optional query parameters (for GET)
+            stream: Use streaming (default False)
+
+        Returns:
+            httpx.Response with the final response
+
+        Raises:
+            HTTPException: On failure after all attempts (502/504)
+        """
+        response = await self._request_with_retry_once(method, url, json_data, params, stream)
+        if response.status_code != 400:
+            return response
+        if not isinstance(json_data, dict) or ADDITIONAL_FIELDS_KEY not in json_data:
+            return response
+
+        body = await response.aread()
+        if not is_rejected_extra_fields(body):
+            return response
+
+        logger.warning(
+            "Kiro rejected {} (HTTP 400, {}); retrying once without it",
+            ADDITIONAL_FIELDS_KEY,
+            describe_kiro_error(body),
+        )
+        json_data.pop(ADDITIONAL_FIELDS_KEY, None)
+        await response.aclose()
+        return await self._request_with_retry_once(method, url, json_data, params, stream)
+
+    async def _request_with_retry_once(
         self,
         method: str,
         url: str,

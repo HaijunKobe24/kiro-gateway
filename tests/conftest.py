@@ -10,8 +10,10 @@ All tests MUST be completely isolated from the network.
 import asyncio
 import json
 import pytest
+import struct
 import time
-from typing import AsyncGenerator, Dict, Any, List
+import zlib
+from typing import AsyncGenerator, Dict, Any, List, Optional, Tuple, Union
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from datetime import datetime, timezone
 
@@ -928,6 +930,296 @@ def create_kiro_usage_chunk(usage: float) -> bytes:
 def create_kiro_context_usage_chunk(percentage: float) -> bytes:
     """Utility for creating a Kiro SSE chunk with context usage."""
     return f'{{"contextUsagePercentage":{percentage}}}'.encode()
+
+
+# =============================================================================
+# Native Reasoning Fixtures (AWS event-stream frames, Anthropic SSE validation, log capture)
+# =============================================================================
+
+class AwsFrameBuilder:
+    """
+    Builds REAL AWS event-stream binary frames (prelude + headers + JSON payload + CRC32).
+
+    The byte layout and payload serialization are identical to frames captured from Kiro
+    (verified byte-for-byte against real captures), so tests exercise the parser with the
+    same bytes the gateway sees in production.
+    """
+
+    SAMPLE_FIRST_REASONING_FRAME_HEX: str = (
+        "000000770000005bd2696bca0b3a6576656e742d74797065070015726561736f6e696e67436f6e74656e74"
+        "4576656e740d3a636f6e74656e742d747970650700106170706c69636174696f6e2f6a736f6e0d3a6d6573"
+        "736167652d747970650700056576656e747b2274657874223a2249227d6720f9b8"
+    )
+
+    @staticmethod
+    def _header(name: bytes, value: bytes) -> bytes:
+        """Encodes one string-typed (type 7) event-stream header."""
+        return bytes([len(name)]) + name + b"\x07" + struct.pack(">H", len(value)) + value
+
+    @staticmethod
+    def build(event_type: str, payload: Union[Dict[str, Any], bytes]) -> bytes:
+        """
+        Builds one complete frame.
+
+        Args:
+            event_type: Value of the :event-type header (e.g. "reasoningContentEvent")
+            payload: JSON-serializable dict, or raw payload bytes (for malformed payloads)
+
+        Returns:
+            Frame bytes including both CRC32 values
+        """
+        if isinstance(payload, bytes):
+            body_json = payload
+        else:
+            body_json = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        headers = (
+            AwsFrameBuilder._header(b":event-type", event_type.encode())
+            + AwsFrameBuilder._header(b":content-type", b"application/json")
+            + AwsFrameBuilder._header(b":message-type", b"event")
+        )
+        prelude = struct.pack(">II", 12 + len(headers) + len(body_json) + 4, len(headers))
+        prelude += struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        body = prelude + headers + body_json
+        return body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    @staticmethod
+    def exception(name: str, payload: Union[Dict[str, Any], bytes]) -> bytes:
+        """
+        Builds an AWS exception frame (":exception-type" header, ":message-type: exception").
+
+        SPECULATION: the layout follows the AWS event-stream specification; no real exception
+        frame sample exists for this gateway.
+
+        Args:
+            name: Value of the :exception-type header (e.g. "ThrottlingException")
+            payload: JSON-serializable dict, or raw payload bytes
+
+        Returns:
+            Frame bytes including both CRC32 values
+        """
+        body_json = payload if isinstance(payload, bytes) else json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        headers = (
+            AwsFrameBuilder._header(b":exception-type", name.encode())
+            + AwsFrameBuilder._header(b":content-type", b"application/json")
+            + AwsFrameBuilder._header(b":message-type", b"exception")
+        )
+        prelude = struct.pack(">II", 12 + len(headers) + len(body_json) + 4, len(headers))
+        prelude += struct.pack(">I", zlib.crc32(prelude) & 0xFFFFFFFF)
+        body = prelude + headers + body_json
+        return body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    @staticmethod
+    def reasoning(text: str) -> bytes:
+        """reasoningContentEvent frame with {"text": ...}."""
+        return AwsFrameBuilder.build("reasoningContentEvent", {"text": text})
+
+    @staticmethod
+    def signature(sig: str) -> bytes:
+        """reasoningContentEvent frame with {"signature": ...}."""
+        return AwsFrameBuilder.build("reasoningContentEvent", {"signature": sig})
+
+    @staticmethod
+    def content(text: str) -> bytes:
+        """assistantResponseEvent frame with {"content": ...}."""
+        return AwsFrameBuilder.build("assistantResponseEvent", {"content": text})
+
+    @staticmethod
+    def tool_start(name: str, tool_id: str) -> bytes:
+        """toolUseEvent frame that starts a tool call."""
+        return AwsFrameBuilder.build("toolUseEvent", {"name": name, "toolUseId": tool_id})
+
+    @staticmethod
+    def tool_input(fragment: str, name: str, tool_id: str) -> bytes:
+        """toolUseEvent frame carrying an input fragment."""
+        return AwsFrameBuilder.build(
+            "toolUseEvent", {"input": fragment, "name": name, "toolUseId": tool_id}
+        )
+
+    @staticmethod
+    def tool_stop(name: str, tool_id: str) -> bytes:
+        """toolUseEvent frame that ends a tool call (shape inferred from parser semantics)."""
+        return AwsFrameBuilder.build(
+            "toolUseEvent", {"name": name, "stop": True, "toolUseId": tool_id}
+        )
+
+    @staticmethod
+    def context_usage(percentage: float) -> bytes:
+        """contextUsageEvent frame."""
+        return AwsFrameBuilder.build("contextUsageEvent", {"contextUsagePercentage": percentage})
+
+    @staticmethod
+    def metering(usage: float) -> bytes:
+        """meteringEvent frame (real payload shape)."""
+        return AwsFrameBuilder.build(
+            "meteringEvent", {"unit": "credit", "unitPlural": "credits", "usage": usage}
+        )
+
+    @staticmethod
+    def split(data: bytes, sizes: List[int]) -> List[bytes]:
+        """
+        Splits a byte stream into chunks of the given sizes (cycled); the remainder is
+        appended as the last chunk.
+        """
+        chunks: List[bytes] = []
+        pos = 0
+        idx = 0
+        while pos < len(data):
+            size = max(1, sizes[idx % len(sizes)])
+            chunks.append(data[pos:pos + size])
+            pos += size
+            idx += 1
+        return chunks
+
+
+@pytest.fixture
+def aws_frames():
+    """Namespace for building real AWS event-stream frames (see AwsFrameBuilder)."""
+    return AwsFrameBuilder
+
+
+class AnthropicSseValidator:
+    """Parses Anthropic SSE strings and strictly validates block ordering."""
+
+    @staticmethod
+    def parse(chunks: List[str]) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Parses SSE strings ("event: x\\ndata: {...}\\n\\n") into (event_type, data) tuples.
+        """
+        events: List[Tuple[str, Dict[str, Any]]] = []
+        for chunk in chunks:
+            for block in chunk.split("\n\n"):
+                block = block.strip()
+                if not block:
+                    continue
+                event_line, data_line = block.split("\n", 1)
+                assert event_line.startswith("event: "), f"bad SSE event line: {event_line!r}"
+                assert data_line.startswith("data: "), f"bad SSE data line: {data_line!r}"
+                events.append((event_line[len("event: "):], json.loads(data_line[len("data: "):])))
+        return events
+
+    @staticmethod
+    def assert_legal(events: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
+        """
+        Asserts that the SSE sequence is a legal Anthropic message stream.
+
+        Checks: message_start first; message_delta then message_stop last; block indices
+        start at 0 and increase by exactly 1; at most one block open at any time; deltas
+        and stops target the currently open block; no block left open at the end.
+
+        Returns:
+            Block type sequence in order, e.g. ["thinking", "text", "tool_use"]
+        """
+        assert events, "no SSE events"
+        assert events[0][0] == "message_start", f"first event is {events[0][0]}"
+        assert events[-1][0] == "message_stop", f"last event is {events[-1][0]}"
+        assert events[-2][0] == "message_delta", f"event before message_stop is {events[-2][0]}"
+        assert sum(1 for e, _ in events if e == "message_start") == 1, "duplicate message_start"
+
+        open_index: Optional[int] = None
+        next_index = 0
+        block_types: List[str] = []
+        for event_type, data in events[1:-2]:
+            if event_type == "content_block_start":
+                assert open_index is None, f"block {data['index']} opened while {open_index} still open"
+                assert data["index"] == next_index, f"index {data['index']} != expected {next_index}"
+                open_index = data["index"]
+                next_index += 1
+                block_types.append(data["content_block"]["type"])
+            elif event_type == "content_block_delta":
+                assert open_index is not None, "delta with no open block"
+                assert data["index"] == open_index, f"delta index {data['index']} != open {open_index}"
+            elif event_type == "content_block_stop":
+                assert open_index is not None, "stop with no open block"
+                assert data["index"] == open_index, f"stop index {data['index']} != open {open_index}"
+                open_index = None
+            else:
+                raise AssertionError(f"unexpected event in message body: {event_type}")
+        assert open_index is None, f"block {open_index} left open at message_delta"
+        return block_types
+
+    @staticmethod
+    def assert_legal_aborted(events: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
+        """
+        Asserts that the SSE sequence is a legal Anthropic stream that ends with an error event.
+
+        Checks: message_start first; block indices start at 0 and increase by exactly 1; at
+        most one block open at any time; deltas and stops target the open block; no block
+        left open before the error; the LAST event is "error" ({"type": "error", ...});
+        no message_delta and no message_stop anywhere.
+
+        Returns:
+            Block type sequence in order, e.g. ["thinking"]
+        """
+        assert events, "no SSE events"
+        assert events[0][0] == "message_start", f"first event is {events[0][0]}"
+        assert events[-1][0] == "error", f"last event is {events[-1][0]}"
+        assert events[-1][1]["type"] == "error"
+        assert "message" in events[-1][1]["error"] and "type" in events[-1][1]["error"]
+        names = [e for e, _ in events]
+        assert "message_delta" not in names and "message_stop" not in names
+        assert names.count("message_start") == 1, "duplicate message_start"
+        assert names.count("error") == 1, "more than one error event"
+
+        open_index: Optional[int] = None
+        next_index = 0
+        block_types: List[str] = []
+        for event_type, data in events[1:-1]:
+            if event_type == "content_block_start":
+                assert open_index is None, f"block {data['index']} opened while {open_index} still open"
+                assert data["index"] == next_index, f"index {data['index']} != expected {next_index}"
+                open_index = data["index"]
+                next_index += 1
+                block_types.append(data["content_block"]["type"])
+            elif event_type == "content_block_delta":
+                assert open_index is not None, "delta with no open block"
+                assert data["index"] == open_index
+            elif event_type == "content_block_stop":
+                assert open_index is not None, "stop with no open block"
+                assert data["index"] == open_index
+                open_index = None
+            else:
+                raise AssertionError(f"unexpected event in message body: {event_type}")
+        assert open_index is None, f"block {open_index} left open before the error event"
+        return block_types
+
+
+@pytest.fixture
+def anthropic_sse():
+    """Anthropic SSE parser / strict validator (see AnthropicSseValidator)."""
+    return AnthropicSseValidator
+
+
+@pytest.fixture
+def loguru_messages():
+    """
+    Collects every loguru message (DEBUG and above) emitted during a test.
+
+    loguru does not propagate to the standard logging module, so caplog cannot be used.
+    """
+    from loguru import logger
+
+    messages: List[str] = []
+    handler_id = logger.add(
+        lambda message: messages.append(str(message)), level="DEBUG", format="{level}|{message}"
+    )
+    yield messages
+    logger.remove(handler_id)
+
+
+@pytest.fixture
+def no_empty_response_guard():
+    """
+    Disables the empty-upstream-response guard (EMPTY_RESPONSE_AS_ERROR=False in streaming_core).
+
+    For tests whose mocked responses have no real AWS byte stream: they exercise retry or
+    formatting logic, not the guard. Guard tests enable it explicitly.
+    """
+    with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+        yield
 
 
 # =============================================================================
@@ -1852,3 +2144,158 @@ def temp_account_credentials_files(tmp_path):
     files["account3"] = str(account3)
     
     return files
+
+
+# =============================================================================
+# additionalModelRequestFields schema fixtures
+# =============================================================================
+
+class ModelSchemas:
+    """Factory and catalogue of additionalModelRequestFieldsSchema fixtures (strict, additionalProperties: false)."""
+
+    EFFORTS = ("low", "medium", "high", "xhigh", "max")
+    DISPLAYS = ("summarized", "omitted")
+
+    @staticmethod
+    def claude(
+        type_enum=("adaptive", "between_tools"),
+        display_enum=("summarized", "omitted"),
+        efforts=("low", "medium", "high", "xhigh", "max"),
+        default="high",
+    ) -> Dict[str, Any]:
+        """Builds a Claude-shaped schema (thinking + output_config)."""
+        thinking_props: Dict[str, Any] = {"type": {"type": "string", "enum": list(type_enum)}}
+        if display_enum is not None:
+            thinking_props["display"] = {"type": "string", "enum": list(display_enum)}
+        return {
+            "type": "object",
+            "properties": {
+                "thinking": {
+                    "type": "object",
+                    "properties": thinking_props,
+                    "additionalProperties": False,
+                },
+                "output_config": {
+                    "type": "object",
+                    "properties": {
+                        "effort": {"type": "string", "enum": list(efforts), "default": default},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def gpt(efforts=("none", "low", "medium", "high", "xhigh", "max")) -> Dict[str, Any]:
+        """Builds a GPT-shaped schema (reasoning.effort only)."""
+        return {
+            "type": "object",
+            "properties": {
+                "reasoning": {
+                    "type": "object",
+                    "properties": {
+                        "effort": {"type": "string", "enum": list(efforts), "default": "medium"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        }
+
+    @classmethod
+    def catalogue(cls) -> Dict[str, Any]:
+        """Returns model id -> raw schema for every supported shape (None = no schema)."""
+        return {
+            "claude-sonnet-5.5": cls.claude(),
+            "claude-sonnet-5": cls.claude(type_enum=("adaptive", "disabled")),
+            "claude-opus-5.5": cls.claude(type_enum=("adaptive",), default="medium"),
+            "claude-fable-5.1": cls.claude(type_enum=("adaptive",)),
+            "gpt-5.6-luna": cls.gpt(),
+            "claude-sonnet-4.5": None,
+            "claude-haiku-4.5": None,
+            "deepseek-3.2": None,
+        }
+
+
+@pytest.fixture
+def model_schemas():
+    """Namespace with additionalModelRequestFieldsSchema factories (see ModelSchemas)."""
+    return ModelSchemas
+
+
+@pytest.fixture
+def schema_model_cache():
+    """
+    Real ModelInfoCache holding models with additionalModelRequestFieldsSchema.
+
+    Models whose schema is None (sonnet-4.5, haiku-4.5, deepseek-3.2) carry an explicit null.
+    """
+    from kiro.cache import ModelInfoCache
+
+    cache = ModelInfoCache()
+    cache._cache = {
+        model_id: {
+            "modelId": model_id,
+            "tokenLimits": {"maxInputTokens": 200000},
+            "additionalModelRequestFieldsSchema": schema,
+        }
+        for model_id, schema in ModelSchemas.catalogue().items()
+    }
+    return cache
+
+
+@pytest.fixture
+def reset_fields_warning_dedup():
+    """Clears the WARNING de-duplication state of kiro.model_request_fields before and after a test."""
+    from kiro.model_request_fields import reset_warning_dedup
+
+    reset_warning_dedup()
+    yield
+    reset_warning_dedup()
+
+
+class ScriptedHttpxClient:
+    """
+    Fake httpx.AsyncClient that replays scripted responses and records every JSON body it is asked to send.
+
+    Used underneath the REAL KiroHttpClient (via patching KiroHttpClient._get_client), so the
+    400 fallback and the retry logic run for real while no network is touched.
+    """
+
+    is_closed = False
+
+    def __init__(self, script):
+        """Stores the scripted outcomes (response mocks or exceptions)."""
+        self.script = list(script)
+        self.sent_bodies: List[Dict[str, Any]] = []
+
+    def build_request(self, method, url, **kwargs):
+        """Returns the kwargs so that send() can read the body."""
+        return kwargs
+
+    async def send(self, request, stream=False):
+        """Streaming send."""
+        return self._next(request)
+
+    async def request(self, method, url, **kwargs):
+        """Non-streaming request."""
+        return self._next(kwargs)
+
+    def _next(self, kwargs):
+        """Records the body and returns / raises the next scripted outcome."""
+        self.sent_bodies.append(json.loads(kwargs["content"]))
+        outcome = self.script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def aclose(self):
+        """No-op close."""
+        return None
+
+
+@pytest.fixture
+def scripted_httpx_client():
+    """Factory for ScriptedHttpxClient."""
+    return ScriptedHttpxClient

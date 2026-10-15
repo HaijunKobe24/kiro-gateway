@@ -383,3 +383,33 @@ class ThinkingParser:
         
         # "as_reasoning_content" - return as-is, caller will put in reasoning_content field
         return thinking_content
+
+
+def format_native_reasoning(
+    text: Optional[str],
+    handling_mode: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Applies FAKE_REASONING_HANDLING to one native reasoning chunk.
+    
+    Native reasoning (Kiro's reasoningContentEvent frames) carries no <thinking> tags,
+    so there is nothing to add or strip. The text is never modified (whitespace,
+    newlines and unicode are preserved).
+    
+    Args:
+        text: Native reasoning text chunk
+        handling_mode: Handling mode. If None, uses FAKE_REASONING_HANDLING from config.
+            - "remove": discard the chunk
+            - "as_reasoning_content", "strip_tags", "pass": return text as-is
+              ("pass" has no original tags to restore, so it equals "strip_tags")
+            - any other value: return text as-is
+    
+    Returns:
+        The text to emit, or None if the chunk is empty or must be discarded
+    """
+    if not text:
+        return None
+    mode = handling_mode or FAKE_REASONING_HANDLING
+    if mode == "remove":
+        return None
+    return text

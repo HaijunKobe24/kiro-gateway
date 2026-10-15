@@ -822,6 +822,133 @@ class TestAccountManagerInitializeAccount:
         assert manager._accounts[account_id].model_cache is not None
 
 
+class TestAccountManagerAdditionalFieldsSchema:
+    """
+    Tests that the per-account model cache keeps additionalModelRequestFieldsSchema.
+    """
+
+    @staticmethod
+    async def _make_manager(tmp_path):
+        """Creates a manager with one JSON account and returns (manager, account_id)."""
+        test_json = tmp_path / "test.json"
+        test_json.write_text(json.dumps({
+            "refreshToken": "test_token",
+            "accessToken": "test_access",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789:profile/test",
+            "region": "us-east-1"
+        }))
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text(json.dumps([
+            {"type": "json", "path": str(test_json), "enabled": True}
+        ]))
+        manager = AccountManager(
+            credentials_file=str(creds_file),
+            state_file=str(tmp_path / "state.json")
+        )
+        await manager.load_credentials()
+        return manager, str(test_json.resolve())
+
+    @staticmethod
+    def _http_class_returning(models):
+        """Builds a patched KiroHttpClient class whose ListAvailableModels returns `models`."""
+        mock_client = AsyncMock()
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"models": models}
+        mock_client.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_client.close = AsyncMock()
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_initialize_keeps_schema_from_list_available_models(self, tmp_path, model_schemas):
+        """
+        What it does: Initializes an account whose ListAvailableModels returns a schema.
+        Purpose: The account's cache exposes the schema; models with a null schema give None.
+        """
+        manager, account_id = await self._make_manager(tmp_path)
+        schema = model_schemas.claude()
+        models = [
+            {"modelId": "claude-sonnet-5.5", "additionalModelRequestFieldsSchema": schema},
+            {"modelId": "claude-sonnet-4.5", "additionalModelRequestFieldsSchema": None},
+        ]
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_http_class.return_value = self._http_class_returning(models)
+            assert await manager._initialize_account(account_id) is True
+
+        cache = manager._accounts[account_id].model_cache
+        assert cache.get_additional_fields_schema("claude-sonnet-5.5") == schema
+        assert cache.get_additional_fields_schema("claude-sonnet-4.5") is None
+
+    @pytest.mark.asyncio
+    async def test_initialize_with_fetch_failure_has_no_schema(self, tmp_path):
+        """
+        What it does: ListAvailableModels fails, FALLBACK_MODELS are used.
+        Purpose: No schema anywhere -> nothing would be sent.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        manager, account_id = await self._make_manager(tmp_path)
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            client = AsyncMock()
+            client.request_with_retry = AsyncMock(side_effect=Exception("Network error"))
+            client.close = AsyncMock()
+            mock_http_class.return_value = client
+            assert await manager._initialize_account(account_id) is True
+
+        cache = manager._accounts[account_id].model_cache
+        for model in FALLBACK_MODELS:
+            assert cache.get_additional_fields_schema(model["modelId"]) is None
+
+    @pytest.mark.asyncio
+    async def test_initialize_on_runtime_endpoint_has_no_schema(self, tmp_path):
+        """
+        What it does: Forces the runtime endpoint branch (static model list).
+        Purpose: The static list has no schemas -> None.
+        """
+        manager, account_id = await self._make_manager(tmp_path)
+
+        with patch('kiro.account_manager._is_runtime_endpoint', return_value=True):
+            assert await manager._initialize_account(account_id) is True
+
+        cache = manager._accounts[account_id].model_cache
+        assert cache.get_additional_fields_schema("claude-sonnet-5.5") is None
+        assert all(cache.get_additional_fields_schema(m) is None for m in cache.get_all_model_ids())
+
+    @pytest.mark.asyncio
+    async def test_ttl_refresh_replaces_schema_and_failed_refresh_keeps_old(self, tmp_path, model_schemas):
+        """
+        What it does: Refreshes models twice: first with a new schema, then with a failing fetch.
+        Purpose: A successful refresh follows schema drift; a failed one keeps the old cache.
+        """
+        manager, account_id = await self._make_manager(tmp_path)
+        old = model_schemas.claude()
+        new = model_schemas.claude(type_enum=("adaptive",))
+
+        with patch('kiro.account_manager.KiroHttpClient') as mock_http_class:
+            mock_http_class.return_value = self._http_class_returning(
+                [{"modelId": "claude-sonnet-5.5", "additionalModelRequestFieldsSchema": old}]
+            )
+            await manager._initialize_account(account_id)
+            cache = manager._accounts[account_id].model_cache
+            assert cache.get_additional_fields_schema("claude-sonnet-5.5") == old
+
+            mock_http_class.return_value = self._http_class_returning(
+                [{"modelId": "claude-sonnet-5.5", "additionalModelRequestFieldsSchema": new}]
+            )
+            await manager._refresh_account_models(account_id)
+            assert cache.get_additional_fields_schema("claude-sonnet-5.5") == new
+
+            failing = AsyncMock()
+            failing.request_with_retry = AsyncMock(side_effect=Exception("down"))
+            failing.close = AsyncMock()
+            mock_http_class.return_value = failing
+            await manager._refresh_account_models(account_id)
+            assert cache.get_additional_fields_schema("claude-sonnet-5.5") == new
+
+
 class TestAccountManagerGetNextAccount:
     """
     Tests for AccountManager.get_next_account() method.

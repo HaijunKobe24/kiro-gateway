@@ -27,8 +27,9 @@ Loads environment variables and provides typed access to them.
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
+from loguru import logger
 
 # Load environment variables
 load_dotenv()
@@ -378,6 +379,155 @@ STREAMING_READ_TIMEOUT: float = float(os.getenv("STREAMING_READ_TIMEOUT", "300")
 FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("FIRST_TOKEN_MAX_RETRIES", "3"))
 
 # ==================================================================================================
+# Empty Upstream Response Settings
+# ==================================================================================================
+
+# HTTP status used when the upstream response is empty and reported as an error.
+EMPTY_RESPONSE_DEFAULT_STATUS: int = 503
+
+# Values accepted by _parse_switch (compared after strip() and lower()).
+SWITCH_TRUE_VALUES: Tuple[str, ...] = ("true", "1", "yes")
+SWITCH_FALSE_VALUES: Tuple[str, ...] = ("false", "0", "no", "off", "")
+
+
+def _parse_switch(name: str, raw: str) -> bool:
+    """
+    Parse a boolean environment switch.
+
+    Whitespace around the value is ignored and the comparison is case-insensitive.
+    "true", "1" and "yes" enable the switch. "false", "0", "no", "off" and an empty
+    value disable it. Any other value (for example a typo) also disables it, which is
+    the historical behavior, but a WARNING is logged so the silent disable is visible.
+
+    Args:
+        name: Environment variable name (used only in the warning)
+        raw: Raw environment variable value
+
+    Returns:
+        True when the switch is enabled, otherwise False
+    """
+    value = raw.strip().lower()
+    if value in SWITCH_TRUE_VALUES:
+        return True
+    if value not in SWITCH_FALSE_VALUES:
+        logger.warning(
+            "{}={!r} is not a recognized boolean (use true/false); treating it as false",
+            name,
+            raw,
+        )
+    return False
+
+
+def _parse_empty_response_status(raw: str) -> int:
+    """
+    Parse EMPTY_RESPONSE_ERROR_STATUS into a valid HTTP 5xx status code.
+
+    Args:
+        raw: Raw environment variable value
+
+    Returns:
+        The parsed status when it is an integer in 500-599, otherwise
+        EMPTY_RESPONSE_DEFAULT_STATUS (503)
+    """
+    try:
+        status = int(raw)
+    except ValueError:
+        return EMPTY_RESPONSE_DEFAULT_STATUS
+    if 500 <= status <= 599:
+        return status
+    return EMPTY_RESPONSE_DEFAULT_STATUS
+
+
+# Convert an empty upstream response into a retryable HTTP error.
+# An "empty upstream response" is an HTTP 200 whose stream ends without any content, reasoning
+# or tool frames and without a meteringEvent frame (only a contextUsageEvent frame, or no bytes).
+# The gateway does NOT retry by itself: the client receives an explicit 5xx error and retries.
+# A response that carries a meteringEvent but no output is a genuine empty model answer and is
+# always passed through unchanged.
+# Default: true. Only "true", "1" and "yes" enable it (surrounding whitespace and case are
+# ignored); any other value disables it, which restores the native behavior (empty response
+# passed through as HTTP 200). An unrecognized value (e.g. a typo) logs a startup WARNING.
+EMPTY_RESPONSE_AS_ERROR: bool = _parse_switch("EMPTY_RESPONSE_AS_ERROR", os.getenv("EMPTY_RESPONSE_AS_ERROR", "true"))
+
+# HTTP status returned for an empty upstream response (must be 500-599).
+# Invalid values fall back to 503.
+# Default: 503
+EMPTY_RESPONSE_ERROR_STATUS: int = _parse_empty_response_status(os.getenv("EMPTY_RESPONSE_ERROR_STATUS", "503"))
+
+# ==================================================================================================
+# Incomplete Upstream Response Settings
+# ==================================================================================================
+
+# Default and allowed values of the in-stream Anthropic error type (see below).
+INCOMPLETE_RESPONSE_DEFAULT_ERROR_TYPE: str = "overloaded_error"
+INCOMPLETE_RESPONSE_ERROR_TYPES: Tuple[str, ...] = ("overloaded_error", "api_error")
+
+
+def _parse_incomplete_error_type(raw: str) -> str:
+    """
+    Parse INCOMPLETE_RESPONSE_ERROR_TYPE into an allowed Anthropic error type.
+
+    Args:
+        raw: Raw environment variable value
+
+    Returns:
+        The normalized (strip + lower) value when it is in INCOMPLETE_RESPONSE_ERROR_TYPES,
+        otherwise INCOMPLETE_RESPONSE_DEFAULT_ERROR_TYPE (a WARNING is logged)
+    """
+    value = raw.strip().lower()
+    if value in INCOMPLETE_RESPONSE_ERROR_TYPES:
+        return value
+    logger.warning(
+        "INCOMPLETE_RESPONSE_ERROR_TYPE={!r} is not one of {}; using {}",
+        raw,
+        list(INCOMPLETE_RESPONSE_ERROR_TYPES),
+        INCOMPLETE_RESPONSE_DEFAULT_ERROR_TYPE,
+    )
+    return INCOMPLETE_RESPONSE_DEFAULT_ERROR_TYPE
+
+
+# Convert an "incomplete upstream response" into a client-visible error.
+# Kiro sometimes ends the stream early while the model is still reasoning: only
+# reasoningContentEvent frames arrive, with no meteringEvent and no text or tool call.
+# The gateway used to pass that through as a normal thinking-only end_turn message, so the
+# client ended its turn with no answer. A response is "incomplete" when the stream ended
+# normally, NO meteringEvent was seen, and NO text and NO tool_use was produced (reasoning
+# does not count). Any response with a meteringEvent is complete and passed through.
+# Non-streaming: HTTP 5xx (EMPTY_RESPONSE_ERROR_STATUS, default 503), like an empty response.
+# Streaming: the HTTP status is already 200 and reasoning is streamed incrementally, so the
+# gateway closes any open block and sends an in-stream error event instead of the normal
+# closing events (Anthropic: "event: error"; OpenAI: a {"error": ...} chunk and [DONE]).
+# A stream that has text or tool_use but no meteringEvent (possibly truncated text) is NOT
+# changed: only a WARNING [IncompleteUpstreamResponse] is logged.
+# Default: true. Same parsing as EMPTY_RESPONSE_AS_ERROR. false restores pass-through.
+INCOMPLETE_RESPONSE_AS_ERROR: bool = _parse_switch(
+    "INCOMPLETE_RESPONSE_AS_ERROR", os.getenv("INCOMPLETE_RESPONSE_AS_ERROR", "true")
+)
+
+# "type" of the Anthropic in-stream error event sent for an incomplete response.
+# Allowed: overloaded_error (default), api_error. Anything else falls back to the default
+# and logs a startup WARNING. Has no effect on OpenAI (always type "server_error").
+INCOMPLETE_RESPONSE_ERROR_TYPE: str = _parse_incomplete_error_type(
+    os.getenv("INCOMPLETE_RESPONSE_ERROR_TYPE", INCOMPLETE_RESPONSE_DEFAULT_ERROR_TYPE)
+)
+
+# ==================================================================================================
+# Model Request Fields Settings
+# ==================================================================================================
+
+# Translate the client's thinking / effort settings into the top-level
+# "additionalModelRequestFields" object of the Kiro request body, driven by the target model's
+# additionalModelRequestFieldsSchema (from ListAvailableModels). Only values allowed by that
+# schema are forwarded; when the schema is missing or unusable nothing is sent. If Kiro answers
+# HTTP 400 because of this field, the gateway retries once without it.
+# This is independent of FAKE_REASONING (which injects text tags into the prompt).
+# Default: true. Same parsing as EMPTY_RESPONSE_AS_ERROR. false restores the old behavior
+# (the field is never sent and Kiro uses the model default).
+FORWARD_MODEL_REQUEST_FIELDS: bool = _parse_switch(
+    "FORWARD_MODEL_REQUEST_FIELDS", os.getenv("FORWARD_MODEL_REQUEST_FIELDS", "true")
+)
+
+# ==================================================================================================
 # Debug Settings
 # ==================================================================================================
 
@@ -471,12 +621,25 @@ FAKE_REASONING_BUDGET_CAP: int = int(os.getenv("FAKE_REASONING_BUDGET_CAP", "100
 # - "pass": Pass through as-is with original tags in content
 # - "strip_tags": Remove tags but keep thinking content in regular content
 #
+# Native reasoning (reasoningContentEvent frames sent directly by Kiro):
+# - Always parsed and delivered according to this setting, independent of FAKE_REASONING
+#   (that switch only controls tag injection / <thinking> tag parsing).
+# - Native reasoning has no tags, so "pass" behaves exactly like "strip_tags".
+# - "remove" discards native reasoning too; the client then receives no bytes while the
+#   model is reasoning.
+#
 # Default: "as_reasoning_content"
 _FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
 if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
     FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
 else:
     FAKE_REASONING_HANDLING: str = "as_reasoning_content"
+
+# Handling modes in which the Anthropic API emits thinking as regular text content.
+# - "pass" / "strip_tags": documented as "keep thinking in regular content".
+# - "include_as_text": legacy value that cannot be selected via the environment variable;
+#   kept for backward compatibility with existing behavior and tests.
+FAKE_REASONING_AS_TEXT_MODES: List[str] = ["include_as_text", "pass", "strip_tags"]
 
 # List of opening tags to detect thinking blocks.
 # The parser will look for any of these tags at the start of the response.

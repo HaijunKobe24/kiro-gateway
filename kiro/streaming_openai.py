@@ -26,11 +26,14 @@ Contains generators for:
 - Processing tool calls in stream
 
 Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
+Native Kiro reasoning (reasoningContentEvent) arrives as KiroEvent("thinking") and is
+mapped like tag-based thinking: reasoning_content delta for "as_reasoning_content",
+content delta for other non-"remove" modes.
 """
 
 import json
 import time
-from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional, Union
 
 import httpx
 from fastapi import HTTPException
@@ -44,13 +47,19 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.empty_response import build_incomplete_stream_error_openai, log_incomplete_stream
+from kiro.upstream_guard import EmptyUpstreamResponseError, StreamOutcome
+
 
 # Import from streaming_core - reuse shared parsing logic
 from kiro.streaming_core import (
     parse_kiro_stream,
     FirstTokenTimeoutError,
     KiroEvent,
+    StreamReadyMarker,
     calculate_tokens_from_context_usage,
+    check_stream_outcome,
+    guard_upstream_response,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
 )
 
@@ -78,7 +87,8 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    raise_on_incomplete: bool = False
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -99,13 +109,18 @@ async def stream_kiro_to_openai_internal(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
-        conversation_id: Stable conversation ID for truncation recovery (optional)
+        raise_on_incomplete: What to do with an incomplete upstream response (reasoning
+            only, no meteringEvent, no text, no tool_use). False (streaming): send an
+            error chunk and [DONE] instead of the finish_reason chunk. True (used when
+            the SSE strings are aggregated into a non-streaming response): raise
+            EmptyUpstreamResponseError(kind="incomplete").
     
     Yields:
         Strings in SSE format: "data: {...}\\n\\n" or "data: [DONE]\\n\\n"
     
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
+        EmptyUpstreamResponseError: Incomplete upstream response and raise_on_incomplete
     
     Example:
         >>> async for chunk in stream_kiro_to_openai_internal(client, response, "claude-sonnet-4", cache, auth):
@@ -126,10 +141,13 @@ async def stream_kiro_to_openai_internal(
     streaming_error_occurred = False
     tool_calls_from_stream = []
     
+    # Side channel: frame counts / text / tool_use / normal end, read after the loop
+    outcome = StreamOutcome()
+    
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
         # This handles AWS SSE parsing, first token timeout, and thinking parser
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        async for event in parse_kiro_stream(response, first_token_timeout, outcome=outcome):
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
@@ -267,6 +285,18 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
+        
+        # Incomplete upstream response (reasoning only, no meteringEvent, no text, no tool_use)
+        if check_stream_outcome(outcome):
+            if raise_on_incomplete:
+                raise outcome.to_error()
+            # Reasoning was already streamed, so the HTTP status cannot change: send the
+            # idiomatic OpenAI in-stream error ({"error": ...}) and [DONE] instead of the
+            # finish_reason chunk.
+            log_incomplete_stream(outcome, model)
+            yield build_incomplete_stream_error_openai()
+            yield "data: [DONE]\n\n"
+            return
         
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
@@ -419,6 +449,9 @@ async def stream_kiro_to_openai_internal(
     except FirstTokenTimeoutError:
         # Propagate timeout up for retry
         raise
+    except EmptyUpstreamResponseError:
+        # Reported by the route (HTTP error); not an unexpected streaming error
+        raise
     except GeneratorExit:
         # Client disconnected - this is normal, don't log as error
         logger.debug("Client disconnected (GeneratorExit)")
@@ -454,13 +487,15 @@ async def stream_kiro_to_openai(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    raise_on_incomplete: bool = False
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to OpenAI format.
     
     This is a wrapper over stream_kiro_to_openai_internal that does NOT retry.
     Retry logic is implemented in stream_with_first_token_retry.
+    
     
     Args:
         client: HTTP client (for connection management)
@@ -470,14 +505,20 @@ async def stream_kiro_to_openai(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        raise_on_incomplete: Raise EmptyUpstreamResponseError for an incomplete upstream
+            response instead of sending an error chunk (see stream_kiro_to_openai_internal)
     
     Yields:
         Strings in SSE format: "data: {...}\\n\\n" or "data: [DONE]\\n\\n"
+    
+    Raises:
+        EmptyUpstreamResponseError: Incomplete upstream response and raise_on_incomplete
     """
     async for chunk in stream_kiro_to_openai_internal(
         client, response, model, model_cache, auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        raise_on_incomplete=raise_on_incomplete
     ):
         yield chunk
 
@@ -492,8 +533,9 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
-) -> AsyncGenerator[str, None]:
+    request_tools: Optional[list] = None,
+    emit_ready_marker: bool = False
+) -> AsyncGenerator[Union[str, StreamReadyMarker], None]:
     """
     Streaming with automatic retry on first token timeout.
     
@@ -517,11 +559,14 @@ async def stream_with_first_token_retry(
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        emit_ready_marker: Yield STREAM_READY once the upstream response was accepted
+            (see streaming_core.prime_sse_stream)
     
     Yields:
-        Strings in SSE format
+        Strings in SSE format, preceded by STREAM_READY when requested
     
     Raises:
+        EmptyUpstreamResponseError: The upstream response was empty (no retry is made)
         HTTPException: After exhausting all attempts
     
     Example:
@@ -569,6 +614,7 @@ async def stream_with_first_token_retry(
         first_token_timeout=first_token_timeout,
         on_http_error=create_http_error,
         on_all_retries_failed=create_timeout_error,
+        emit_ready_marker=emit_ready_marker,
     ):
         yield chunk
 
@@ -599,7 +645,16 @@ async def collect_stream_response(
     
     Returns:
         Dictionary with full response in OpenAI chat.completion format
+    
+    Raises:
+        EmptyUpstreamResponseError: The upstream response was empty (no output and no
+            metering) and EMPTY_RESPONSE_AS_ERROR is enabled, or it was incomplete
+            (reasoning only, no metering, no text, no tool_use) and
+            INCOMPLETE_RESPONSE_AS_ERROR is enabled
     """
+    # Reject an empty upstream response before any SSE formatting starts
+    response = await guard_upstream_response(response, FIRST_TOKEN_TIMEOUT)
+    
     full_content = ""
     full_reasoning_content = ""
     final_usage = None
@@ -614,7 +669,8 @@ async def collect_stream_response(
         model_cache,
         auth_manager,
         request_messages=request_messages,
-        request_tools=request_tools
+        request_tools=request_tools,
+        raise_on_incomplete=True
     ):
         if not chunk_str.startswith("data:"):
             continue

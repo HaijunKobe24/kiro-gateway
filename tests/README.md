@@ -70,38 +70,41 @@ pytest -n auto
 
 ```
 tests/
-├── conftest.py                      # Shared fixtures and utilities
+├── conftest.py                      # Shared fixtures and utilities (incl. model_schemas / schema_model_cache: additionalModelRequestFieldsSchema fixtures for sonnet-5.5 / sonnet-5 / opus-5.5 / fable-5.1 / gpt-5.6-luna / null-schema models, scripted_httpx_client: fake httpx client under the real KiroHttpClient, aws_frames: real AWS event-stream frame builder, anthropic_sse: strict SSE validators (assert_legal / assert_legal_aborted for streams that end with an error event), loguru_messages: log capture, no_empty_response_guard: disables the empty-response guard for tests with mocked responses)
 ├── unit/                            # Unit tests for individual components
 │   ├── test_account_errors.py      # Account System error classification (FATAL vs RECOVERABLE)
-│   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence)
+│   ├── test_account_manager.py     # AccountManager tests (failover, Circuit Breaker, sticky behavior, state persistence, schema retention on init / refresh / fallback)
 │   ├── test_auth_manager.py        # KiroAuthManager tests (including api_region parameter priority)
-│   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model)
-│   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants)
-│   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests
-│   ├── test_converters_core.py     # Shared conversion logic tests (UnifiedMessage, merging, truncation recovery system prompt)
-│   ├── test_converters_openai.py   # OpenAI Chat API → Kiro converter tests
+│   ├── test_cache.py               # ModelInfoCache tests (is_valid_model, add_hidden_model, get_additional_fields_schema retention / hidden / fallback)
+│   ├── test_config.py              # Configuration tests (SERVER_HOST, SERVER_PORT, LOG_LEVEL, Account System constants, FAKE_REASONING_AS_TEXT_MODES, EMPTY_RESPONSE_AS_ERROR / EMPTY_RESPONSE_ERROR_STATUS, INCOMPLETE_RESPONSE_AS_ERROR / INCOMPLETE_RESPONSE_ERROR_TYPE, boolean switch parsing with strip() and startup warnings, FORWARD_MODEL_REQUEST_FIELDS)
+│   ├── test_converters_anthropic.py # Anthropic Messages API → Kiro converter tests (incl. thinking / output_config.effort -> additionalModelRequestFields)
+│   ├── test_converters_core.py     # Shared conversion logic tests (UnifiedMessage, merging, truncation recovery system prompt, additional_model_request_fields top-level key)
+│   ├── test_converters_openai.py   # OpenAI Chat API → Kiro converter tests (incl. reasoning_effort -> additionalModelRequestFields)
 │   ├── test_debug_logger.py        # DebugLogger tests (off/errors/all modes)
 │   ├── test_debug_middleware.py    # DebugLoggerMiddleware tests (endpoint filtering, mode handling)
+│   ├── test_empty_response.py      # Empty / incomplete upstream response error (503 / 529 status, Anthropic + OpenAI error bodies, in-stream error events, x-should-retry, WARNING log without message content, request context helper)
 │   ├── test_exceptions.py          # Exception handlers tests (validation_exception_handler, sanitize_validation_errors)
-│   ├── test_http_client.py         # KiroHttpClient tests (including params parameter for Account System)
+│   ├── test_http_client.py         # KiroHttpClient tests (including params parameter for Account System, HTTP 400 additionalModelRequestFields fallback: single retry, in-place strip, no interference with 403 / 5xx)
 │   ├── test_kiro_errors.py         # Kiro API error enhancement tests (CONTENT_LENGTH_EXCEEDS_THRESHOLD, unknown errors)
 │   ├── test_main_cli.py            # CLI argument parsing tests (--host, --port)
 │   ├── test_main_lifespan.py       # Application lifespan tests (Account System initialization, legacy migration, background tasks)
 │   ├── test_mcp_tools.py           # MCP Tools tests (WebSearch: ID generation, MCP API calls, SSE emulation, query extraction)
+│   ├── test_model_request_fields.py # additionalModelRequestFields translation (schema parsing, minimal JSON Schema validator, per-shape rules, drop + WARNING de-dup, self-check, hypothesis property, resolve entry point)
 │   ├── test_model_resolver.py      # Dynamic Model Resolution System tests
 │   ├── test_models_anthropic.py    # Anthropic Pydantic models tests (all content blocks, tools, streaming, server-side tools)
 │   ├── test_models_openai.py       # OpenAI Pydantic models tests (messages, tools, responses, streaming)
 │   ├── test_network_errors.py      # Network error handling tests
-│   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration)
-│   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover)
-│   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover)
-│   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse)
-│   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter)
-│   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse)
-│   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks)
+│   ├── test_parsers.py             # AwsEventStreamParser tests (JSON truncation diagnostics, truncation recovery integration, native reasoningContentEvent frames: chunking, UTF-8 splits, escapes, log safety)
+│   ├── test_routes_anthropic.py    # Anthropic API endpoint tests (/v1/messages, truncation recovery, WebSearch, Account System failover, native reasoning on all 4 route paths, empty upstream response and incomplete upstream response on all 4 route paths, cancellation closes the upstream connection, additionalModelRequestFields on all 4 route paths + 400 fallback end to end)
+│   ├── test_routes_openai.py       # OpenAI API endpoint tests (/v1/chat/completions, truncation recovery, WebSearch, Account System failover, native reasoning on all 4 route paths, empty upstream response and incomplete upstream response on all 4 route paths, cancellation closes the upstream connection, additionalModelRequestFields on all 4 route paths + 400 fallback end to end)
+│   ├── test_streaming_anthropic.py # Anthropic streaming response tests (truncation detection, stop_reason priority, initial_response reuse, native reasoning block ordering, FAKE_REASONING_HANDLING modes, empty upstream response / single message_start on first token retry, incomplete response -> content_block_stop + error event, non-streaming raise)
+│   ├── test_streaming_core.py      # Shared streaming logic tests (first-token retry, initial_response parameter, native reasoning -> thinking events, incremental delivery, empty-response guard, STREAM_READY / prime_sse_stream, guard + first token retry, StreamOutcome verdicts through parse_kiro_stream, check_stream_outcome, collect_stream_to_result incomplete, peek-phase cancellation cleanup)
+│   ├── test_streaming_openai.py    # OpenAI streaming response tests (truncation detection, finish_reason priority, initial_response reuse, native reasoning streaming / non-streaming, empty upstream response, incomplete response -> error chunk + [DONE], non-streaming raise)
+│   ├── test_thinking_parser.py     # ThinkingParser tests (FSM for thinking blocks, format_native_reasoning)
 │   ├── test_tokenizer.py           # Tokenizer tests (tiktoken)
 │   ├── test_truncation_recovery.py # Truncation Recovery System tests (synthetic message generation)
 │   ├── test_truncation_state.py    # Truncation state cache tests (save/retrieve, one-time retrieval, thread safety)
+│   ├── test_upstream_guard.py      # Empty / incomplete upstream response detection (AWS frame header scanner exact across every chunk boundary incl. :exception-type, StreamOutcome verdict table, GuardedResponse replay, hypothesis chunking property)
 │   └── test_vpn_proxy.py           # VPN/Proxy configuration tests (environment variables, URL normalization, NO_PROXY)
 ├── integration/                     # Integration tests for full flow
 │   ├── test_account_system_flow.py # Account System integration tests (full failover, sticky behavior, Circuit Breaker, state persistence)

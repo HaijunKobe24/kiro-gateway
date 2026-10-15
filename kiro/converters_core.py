@@ -44,6 +44,7 @@ from kiro.config import (
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
+from kiro.model_request_fields import ADDITIONAL_FIELDS_KEY
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
@@ -1414,7 +1415,8 @@ def build_kiro_payload(
     tools: Optional[List[UnifiedTool]],
     conversation_id: str,
     profile_arn: str,
-    thinking_config: ThinkingConfig
+    thinking_config: ThinkingConfig,
+    additional_model_request_fields: Optional[Dict[str, Any]] = None
 ) -> KiroPayloadResult:
     """
     Builds complete payload for Kiro API from unified data.
@@ -1588,6 +1590,10 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Add model-specific request fields (thinking / effort), already validated against the model schema
+    if additional_model_request_fields:
+        payload[ADDITIONAL_FIELDS_KEY] = additional_model_request_fields
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

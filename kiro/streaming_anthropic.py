@@ -34,7 +34,7 @@ Reference: https://docs.anthropic.com/en/api/messages-streaming
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any
+from typing import TYPE_CHECKING, AsyncGenerator, Dict, List, Optional, Any, Union
 
 import httpx
 from loguru import logger
@@ -44,12 +44,21 @@ from kiro.streaming_core import (
     collect_stream_to_result,
     FirstTokenTimeoutError,
     KiroEvent,
+    StreamReadyMarker,
     calculate_tokens_from_context_usage,
+    check_stream_outcome,
     stream_with_first_token_retry,
 )
+from kiro.empty_response import build_incomplete_stream_error_anthropic, log_incomplete_stream
+from kiro.upstream_guard import StreamOutcome
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
-from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
+from kiro.config import (
+    FIRST_TOKEN_TIMEOUT,
+    FIRST_TOKEN_MAX_RETRIES,
+    FAKE_REASONING_HANDLING,
+    FAKE_REASONING_AS_TEXT_MODES,
+)
 
 if TYPE_CHECKING:
     from kiro.auth import KiroAuthManager
@@ -135,13 +144,16 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    emit_message_start: bool = True
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
     
     Parses Kiro AWS SSE stream and converts events to Anthropic format.
     Supports thinking content blocks when FAKE_REASONING_HANDLING=as_reasoning_content.
+    Tag-based thinking and native Kiro reasoning (reasoningContentEvent) both arrive as
+    "thinking" events and share this path, so reasoning is streamed incrementally.
     
     Args:
         response: HTTP response with data stream
@@ -153,12 +165,19 @@ async def stream_kiro_to_anthropic(
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
         conversation_id: Stable conversation ID for truncation recovery (optional)
+        emit_message_start: Whether to send the message_start event. False is used when
+            a previous attempt of the same HTTP response already sent it (first token
+            retry), because a stream must contain exactly one message_start.
     
     Yields:
         Strings in Anthropic SSE format
     
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
+
+    An incomplete upstream response (reasoning only, no meteringEvent, no text, no tool_use,
+    see streaming_core.check_stream_outcome) ends the stream with an "event: error" instead
+    of message_delta/message_stop, after closing the open content block.
     """
     message_id = generate_message_id()
     input_tokens = 0
@@ -200,27 +219,31 @@ async def stream_kiro_to_anthropic(
     
     # Track truncated tool calls for recovery
     truncated_tools: List[Dict[str, Any]] = []
-    
+
+    # Side channel: frame counts / text / tool_use / normal end, read after the loop
+    outcome = StreamOutcome()
+
     try:
-        # Send message_start event
-        yield format_sse_event("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": model,
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": 0
+        # Send message_start event (once per HTTP response, see emit_message_start)
+        if emit_message_start:
+            yield format_sse_event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0
+                    }
                 }
-            }
-        })
+            })
         
-        async for event in parse_kiro_stream(response, first_token_timeout):
+        async for event in parse_kiro_stream(response, first_token_timeout, outcome=outcome):
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
@@ -266,6 +289,16 @@ async def stream_kiro_to_anthropic(
                 if FAKE_REASONING_HANDLING == "as_reasoning_content":
                     # Use native Anthropic thinking content blocks
                     if not thinking_block_started:
+                        # A new block may only open when no other block is open
+                        # (native reasoning can arrive after text content)
+                        if text_block_started and text_block_index is not None:
+                            yield format_sse_event("content_block_stop", {
+                                "type": "content_block_stop",
+                                "index": text_block_index
+                            })
+                            text_block_started = False
+                            current_block_index += 1
+                        
                         thinking_block_index = current_block_index
                         yield format_sse_event("content_block_start", {
                             "type": "content_block_start",
@@ -288,7 +321,7 @@ async def stream_kiro_to_anthropic(
                             }
                         })
                 
-                elif FAKE_REASONING_HANDLING == "include_as_text":
+                elif FAKE_REASONING_HANDLING in FAKE_REASONING_AS_TEXT_MODES:
                     # Include thinking as regular text content
                     # Close thinking block if it was open (shouldn't happen in this mode)
                     if thinking_block_started and thinking_block_index is not None:
@@ -523,6 +556,24 @@ async def stream_kiro_to_anthropic(
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
         
+        # Incomplete upstream response (reasoning only, no meteringEvent, no text, no tool_use):
+        # reasoning was already streamed, so the HTTP status cannot change. Close the open
+        # block in order, send an error event instead of message_delta/message_stop, and end.
+        if check_stream_outcome(outcome):
+            if thinking_block_started and thinking_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": thinking_block_index
+                })
+            if text_block_started and text_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": text_block_index
+                })
+            log_incomplete_stream(outcome, model)
+            yield build_incomplete_stream_error_anthropic()
+            return
+
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
         
@@ -743,6 +794,10 @@ async def collect_anthropic_response(
     
     Returns:
         Dictionary with full response in Anthropic Messages format
+
+    Raises:
+        EmptyUpstreamResponseError: The upstream response was empty, or incomplete
+            (reasoning only, no meteringEvent, no text, no tool_use)
     """
     message_id = generate_message_id()
     
@@ -773,9 +828,9 @@ async def collect_anthropic_response(
         })
     
     # Add text block if there's content
-    # For include_as_text mode, prepend thinking content to regular content
+    # For text modes (include_as_text / pass / strip_tags), prepend thinking content to regular content
     text_content = result.content
-    if result.thinking_content and FAKE_REASONING_HANDLING == "include_as_text":
+    if result.thinking_content and FAKE_REASONING_HANDLING in FAKE_REASONING_AS_TEXT_MODES:
         text_content = result.thinking_content + text_content
     
     if text_content:
@@ -873,8 +928,9 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
-) -> AsyncGenerator[str, None]:
+    request_system: Optional[Any] = None,
+    emit_ready_marker: bool = False
+) -> AsyncGenerator[Union[str, StreamReadyMarker], None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
     
@@ -896,13 +952,21 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        emit_ready_marker: Yield STREAM_READY once the upstream response was accepted
+            (see streaming_core.prime_sse_stream)
     
     Yields:
-        Strings in Anthropic SSE format
+        Strings in Anthropic SSE format, preceded by STREAM_READY when requested
     
     Raises:
+        EmptyUpstreamResponseError: The upstream response was empty (no retry is made)
         Exception with Anthropic error format after exhausting all attempts
     """
+    # True once a message_start event was really sent to the client. A retry attempt must
+    # not send a second one (it can happen when the empty-response guard is disabled and
+    # the first token times out inside stream_kiro_to_anthropic).
+    message_started = False
+
     def create_http_error(status_code: int, error_text: str) -> Exception:
         """Create exception for HTTP errors in Anthropic format."""
         return Exception(json.dumps({
@@ -925,6 +989,7 @@ async def stream_with_first_token_retry_anthropic(
     
     async def stream_processor(response: httpx.Response) -> AsyncGenerator[str, None]:
         """Process response and yield Anthropic SSE chunks."""
+        nonlocal message_started
         async for chunk in stream_kiro_to_anthropic(
             response,
             model,
@@ -934,7 +999,9 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            emit_message_start=not message_started,
         ):
+            message_started = True
             yield chunk
     
     async for chunk in stream_with_first_token_retry(
@@ -945,5 +1012,6 @@ async def stream_with_first_token_retry_anthropic(
         first_token_timeout=first_token_timeout,
         on_http_error=create_http_error,
         on_all_retries_failed=create_timeout_error,
+        emit_ready_marker=emit_ready_marker,
     ):
         yield chunk

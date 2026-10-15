@@ -1872,3 +1872,116 @@ class TestBuildKiroPayloadIntegration:
         print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestOpenAIModelRequestFields:
+    """Tests for reasoning_effort forwarding into additionalModelRequestFields."""
+
+    @staticmethod
+    def _request(model="claude-sonnet-5.5", **kwargs):
+        """Builds an OpenAI chat request."""
+        return ChatCompletionRequest(
+            model=model, messages=[ChatMessage(role="user", content="Hello")], **kwargs
+        )
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    def test_claude_shaped_model_gets_output_config(self, schema_model_cache, effort):
+        """
+        What it does: reasoning_effort on a Claude-shaped schema.
+        Purpose: Becomes output_config.effort; never thinking.
+        """
+        payload = build_kiro_payload(
+            self._request(reasoning_effort=effort), "c", "arn:aws:test", model_cache=schema_model_cache
+        )
+
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": effort}}
+
+    @pytest.mark.parametrize("effort", ["none", "minimal"])
+    def test_none_and_minimal_are_dropped_on_claude_shape(self, schema_model_cache, effort):
+        """
+        What it does: OpenAI-only effort names on a Claude schema.
+        Purpose: Not in the enum -> key absent (and never a guessed thinking.disabled).
+        """
+        payload = build_kiro_payload(
+            self._request(reasoning_effort=effort), "c", "arn:aws:test", model_cache=schema_model_cache
+        )
+
+        assert "additionalModelRequestFields" not in payload
+
+    @pytest.mark.parametrize("effort,expected", [
+        ("none", {"reasoning": {"effort": "none"}}),
+        ("low", {"reasoning": {"effort": "low"}}),
+        ("medium", {"reasoning": {"effort": "medium"}}),
+        ("high", {"reasoning": {"effort": "high"}}),
+        ("xhigh", {"reasoning": {"effort": "xhigh"}}),
+        ("minimal", None),
+    ])
+    def test_gpt_shaped_model_gets_reasoning(self, schema_model_cache, effort, expected):
+        """
+        What it does: reasoning_effort on gpt-5.6-luna.
+        Purpose: reasoning.effort when in the enum; minimal is dropped; no thinking / output_config.
+        """
+        payload = build_kiro_payload(
+            self._request(model="gpt-5.6-luna", reasoning_effort=effort), "c", "arn:aws:test",
+            model_cache=schema_model_cache,
+        )
+
+        assert payload.get("additionalModelRequestFields") == expected
+
+    def test_no_reasoning_effort_means_no_field(self, schema_model_cache):
+        """
+        What it does: Request without reasoning_effort.
+        Purpose: Key absent.
+        """
+        payload = build_kiro_payload(self._request(), "c", "arn:aws:test", model_cache=schema_model_cache)
+
+        assert "additionalModelRequestFields" not in payload
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-4-5", "claude-haiku-4-5", "deepseek-3.2", "unknown-model"])
+    def test_models_without_schema_get_no_field(self, schema_model_cache, model):
+        """
+        What it does: Models with a null schema / not cached.
+        Purpose: Key absent.
+        """
+        payload = build_kiro_payload(
+            self._request(model=model, reasoning_effort="high"), "c", "arn:aws:test",
+            model_cache=schema_model_cache,
+        )
+
+        assert "additionalModelRequestFields" not in payload
+
+    def test_without_cache_or_with_switch_off_payload_is_unchanged(self, schema_model_cache):
+        """
+        What it does: No cache, and switch off with a cache.
+        Purpose: Both equal the pre-feature payload.
+        """
+        request = self._request(reasoning_effort="high")
+        baseline = build_kiro_payload(request, "c", "arn:aws:test")
+
+        with patch("kiro.model_request_fields.FORWARD_MODEL_REQUEST_FIELDS", False):
+            switched_off = build_kiro_payload(request, "c", "arn:aws:test", model_cache=schema_model_cache)
+
+        assert "additionalModelRequestFields" not in baseline
+        assert switched_off == baseline
+
+    def test_dated_dashed_model_name_hits_the_schema(self, schema_model_cache):
+        """
+        What it does: claude-sonnet-5-5-20261001 through the real resolver.
+        Purpose: Lookup uses the normalized internal id.
+        """
+        payload = build_kiro_payload(
+            self._request(model="claude-sonnet-5-5-20261001", reasoning_effort="high"), "c", "arn:aws:test",
+            model_cache=schema_model_cache,
+        )
+
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "high"}}
+
+    def test_reasoning_extra_object_is_not_read(self, schema_model_cache):
+        """
+        What it does: Extra "reasoning" and "output_config" request fields (kept as extras by the model).
+        Purpose: Only the declared reasoning_effort is read; extras are never forwarded.
+        """
+        request = self._request(reasoning={"effort": "high"}, output_config={"effort": "high"})
+        payload = build_kiro_payload(request, "c", "arn:aws:test", model_cache=schema_model_cache)
+
+        assert "additionalModelRequestFields" not in payload

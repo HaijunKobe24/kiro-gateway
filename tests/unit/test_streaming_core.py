@@ -20,6 +20,7 @@ from dataclasses import asdict
 
 from kiro.streaming_core import (
     KiroEvent,
+    NativeReasoningStats,
     StreamResult,
     FirstTokenTimeoutError,
     parse_kiro_stream,
@@ -168,6 +169,7 @@ class TestKiroEvent:
         assert event.context_usage_percentage is None
         assert event.is_first_thinking_chunk is False
         assert event.is_last_thinking_chunk is False
+        assert event.is_native_reasoning is False
         print("✓ All default values are correct")
 
 
@@ -1242,6 +1244,7 @@ class TestStreamingCoreErrorHandling:
 # Tests for stream_with_first_token_retry()
 # ==================================================================================================
 
+@pytest.mark.usefixtures("no_empty_response_guard")
 class TestStreamWithFirstTokenRetryCore:
     """
     Tests for stream_with_first_token_retry() generic function.
@@ -1832,3 +1835,1923 @@ class TestStreamWithFirstTokenRetryCore:
         assert make_request_call_count == 1
         assert len(chunks) == 1
         print("✓ make_request called immediately when initial_response is None")
+
+
+# ==================================================================================================
+# Native reasoning (reasoningContentEvent) tests
+# ==================================================================================================
+
+SECRET_MARKER = "SECRET_REASONING_MARKER_7f3a"
+
+
+def _bytes_response(mock_response, chunks, pulled=None):
+    """Attaches an aiter_bytes yielding chunks to mock_response (optionally counting pulls)."""
+    async def aiter_bytes():
+        for chunk in chunks:
+            if pulled is not None:
+                pulled.append(1)
+            yield chunk
+
+    mock_response.aiter_bytes = aiter_bytes
+    return mock_response
+
+
+async def _collect_events(response, **kwargs):
+    """Runs parse_kiro_stream and returns all KiroEvents."""
+    return [e async for e in parse_kiro_stream(response, first_token_timeout=30, **kwargs)]
+
+
+class TestNativeReasoningStats:
+    """Tests for the NativeReasoningStats counters dataclass."""
+
+    def test_defaults_are_zero(self):
+        """
+        What it does: Creates default stats.
+        Goal: All counters start at zero.
+        """
+        stats = NativeReasoningStats()
+        assert (stats.frames, stats.chars, stats.signature_frames, stats.discarded_frames) == (0, 0, 0, 0)
+
+    def test_instances_do_not_share_state(self):
+        """
+        What it does: Mutates one instance.
+        Goal: Another instance is untouched.
+        """
+        a, b = NativeReasoningStats(), NativeReasoningStats()
+        a.frames += 5
+        assert b.frames == 0
+
+
+class TestKiroEventNativeReasoningFlag:
+    """Tests for KiroEvent.is_native_reasoning."""
+
+    def test_can_be_set_true(self):
+        """
+        What it does: Creates a thinking event flagged as native.
+        Goal: Flag is stored.
+        """
+        event = KiroEvent(type="thinking", thinking_content="x", is_native_reasoning=True)
+        assert event.is_native_reasoning is True
+
+
+class TestProcessChunkNativeReasoning:
+    """Tests for native reasoning handling inside _process_chunk()."""
+
+    @staticmethod
+    async def _run(mock_parser, events, thinking_parser=None, stats=None):
+        mock_parser.feed.return_value = events
+        if stats is None:
+            return [e async for e in _process_chunk(mock_parser, b"x", thinking_parser)]
+        return [e async for e in _process_chunk(mock_parser, b"x", thinking_parser, stats)]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_event_becomes_native_thinking_event(self, mock_parser):
+        """
+        What it does: Feeds a reasoning parser event.
+        Goal: Yields KiroEvent(thinking) flagged native, with first/last flags False.
+        """
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+            events = await self._run(mock_parser, [{"type": "reasoning", "data": "think"}])
+
+        assert len(events) == 1
+        assert events[0].type == "thinking"
+        assert events[0].thinking_content == "think"
+        assert events[0].is_native_reasoning is True
+        assert events[0].is_first_thinking_chunk is False
+        assert events[0].is_last_thinking_chunk is False
+        assert events[0].content is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["as_reasoning_content", "strip_tags", "pass"])
+    async def test_non_remove_modes_deliver_original_text(self, mock_parser, mode):
+        """
+        What it does: Applies each non-remove FAKE_REASONING_HANDLING mode.
+        Goal: Text delivered unchanged (native reasoning has no tags to add or strip).
+        """
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", mode):
+            events = await self._run(mock_parser, [{"type": "reasoning", "data": " spaced \n"}])
+
+        assert [e.thinking_content for e in events] == [" spaced \n"]
+
+    @pytest.mark.asyncio
+    async def test_remove_mode_discards_and_counts(self, mock_parser):
+        """
+        What it does: Applies FAKE_REASONING_HANDLING=remove.
+        Goal: No event is yielded; frames/chars/discarded counters are updated.
+        """
+        stats = NativeReasoningStats()
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "remove"):
+            events = await self._run(
+                mock_parser,
+                [{"type": "reasoning", "data": "abc"}, {"type": "reasoning", "data": "de"}],
+                stats=stats,
+            )
+
+        assert events == []
+        assert (stats.frames, stats.chars, stats.discarded_frames) == (2, 5, 2)
+
+    @pytest.mark.asyncio
+    async def test_signature_event_is_counted_not_yielded(self, mock_parser):
+        """
+        What it does: Feeds a reasoning_signature event.
+        Goal: No KiroEvent; signature_frames incremented.
+        """
+        stats = NativeReasoningStats()
+        events = await self._run(mock_parser, [{"type": "reasoning_signature", "data": 40}], stats=stats)
+        assert events == []
+        assert stats.signature_frames == 1
+        assert stats.frames == 0
+
+    @pytest.mark.asyncio
+    async def test_works_without_stats_argument(self, mock_parser):
+        """
+        What it does: Calls _process_chunk with the legacy three arguments.
+        Goal: Backward compatible - no stats needed.
+        """
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "remove"):
+            assert await self._run(mock_parser, [{"type": "reasoning", "data": "a"}]) == []
+        events = await self._run(
+            mock_parser,
+            [{"type": "reasoning", "data": "a"}, {"type": "reasoning_signature", "data": 3}],
+        )
+        assert [e.thinking_content for e in events] == ["a"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parser_kind", ["none", "mock"])
+    async def test_independent_of_thinking_parser(self, mock_parser, parser_kind):
+        """
+        What it does: Runs with thinking_parser=None and with a MagicMock parser.
+        Goal: Native reasoning never touches the tag parser.
+        """
+        thinking_parser = None if parser_kind == "none" else MagicMock()
+        events = await self._run(
+            mock_parser, [{"type": "reasoning", "data": "r"}], thinking_parser=thinking_parser
+        )
+
+        assert [e.thinking_content for e in events] == ["r"]
+        if thinking_parser is not None:
+            thinking_parser.feed.assert_not_called()
+            thinking_parser.process_for_output.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mixed_chunk_preserves_upstream_order(self, mock_parser):
+        """
+        What it does: reasoning, content, reasoning, usage, context_usage in one chunk.
+        Goal: Output order equals upstream order.
+        """
+        events = await self._run(mock_parser, [
+            {"type": "reasoning", "data": "r1"},
+            {"type": "content", "data": "c1"},
+            {"type": "reasoning", "data": "r2"},
+            {"type": "usage", "data": 0.5},
+            {"type": "context_usage", "data": 4.0},
+        ])
+
+        assert [e.type for e in events] == ["thinking", "content", "thinking", "usage", "context_usage"]
+        assert events[0].thinking_content == "r1"
+        assert events[2].thinking_content == "r2"
+
+    @pytest.mark.asyncio
+    async def test_unknown_event_type_is_ignored(self, mock_parser):
+        """
+        What it does: Feeds an unknown event type.
+        Goal: Ignored, neighbours unaffected.
+        """
+        events = await self._run(mock_parser, [
+            {"type": "mystery", "data": 1}, {"type": "reasoning", "data": "ok"},
+        ])
+        assert [e.thinking_content for e in events] == ["ok"]
+
+
+class TestParseKiroStreamNativeReasoning:
+    """parse_kiro_stream() with the REAL AwsEventStreamParser and real AWS frames."""
+
+    TEXTS = ["I", "'ll", " check", ".\n\n", "中文推理", " 😀", " — done"]
+
+    @pytest.fixture(autouse=True)
+    def _config(self):
+        """Pins reasoning config so a user .env cannot influence the tests."""
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", True), \
+                patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_every_text_frame_becomes_exactly_one_thinking_event(self, mock_response, aws_frames):
+        """
+        What it does: N reasoning frames + signature + content.
+        Goal: Exactly N thinking events (equal to the frame count), all flagged native, text intact.
+        """
+        data = b"".join(aws_frames.reasoning(t) for t in self.TEXTS)
+        data += aws_frames.signature("QUJD") + aws_frames.content("answer")
+        _bytes_response(mock_response, [data])
+
+        events = await _collect_events(mock_response)
+
+        thinking = [e for e in events if e.type == "thinking"]
+        print(f"Thinking events: {len(thinking)} (frames: {len(self.TEXTS)})")
+        assert len(thinking) == len(self.TEXTS)
+        assert all(e.is_native_reasoning for e in thinking)
+        assert [e.thinking_content for e in thinking] == self.TEXTS
+        assert [e.content for e in events if e.type == "content"] == ["answer"]
+
+    @pytest.mark.asyncio
+    async def test_thinking_is_delivered_incrementally(self, mock_response, aws_frames):
+        """
+        What it does: One frame per network chunk; records how many chunks were pulled when
+        each thinking event is yielded.
+        Goal: The k-th thinking event is available before chunk k+1 is pulled - this is the
+        bug fix (previously the client got zero bytes while reasoning).
+        """
+        pulled = []
+        chunks = [aws_frames.reasoning(t) for t in self.TEXTS] + [aws_frames.content("end")]
+        _bytes_response(mock_response, chunks, pulled)
+
+        pulled_at_event = []
+        async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+            if event.type == "thinking":
+                pulled_at_event.append(len(pulled))
+
+        assert pulled_at_event == list(range(1, len(self.TEXTS) + 1))
+
+    @pytest.mark.asyncio
+    async def test_arbitrary_chunking_gives_identical_events(self, mock_response, aws_frames):
+        """
+        What it does: Same stream chunked 1 byte at a time and in odd sizes.
+        Goal: Identical thinking text sequence.
+        """
+        data = b"".join(aws_frames.reasoning(t) for t in self.TEXTS) + aws_frames.content("tail")
+        _bytes_response(mock_response, [data])
+        baseline = [e.thinking_content for e in await _collect_events(mock_response) if e.type == "thinking"]
+
+        for sizes in ([1], [2, 3], [7], [1000]):
+            _bytes_response(mock_response, aws_frames.split(data, sizes))
+            got = [e.thinking_content for e in await _collect_events(mock_response) if e.type == "thinking"]
+            assert got == baseline, f"sizes {sizes}"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_then_content_then_tool_use_order(self, mock_response, aws_frames):
+        """
+        What it does: reasoning -> content -> tool call frames.
+        Goal: thinking before content before tool_use.
+        """
+        data = b"".join([
+            aws_frames.reasoning("plan"),
+            aws_frames.content("say"),
+            aws_frames.tool_start("Bash", "toolu_1"),
+            aws_frames.tool_input('{"command": "ls"}', "Bash", "toolu_1"),
+            aws_frames.tool_stop("Bash", "toolu_1"),
+        ])
+        _bytes_response(mock_response, [data])
+
+        events = await _collect_events(mock_response)
+
+        assert [e.type for e in events] == ["thinking", "content", "tool_use"]
+        assert events[2].tool_use["function"]["name"] == "Bash"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_then_pure_tool_use(self, mock_response, aws_frames):
+        """
+        What it does: Reasoning frames followed only by a tool call (no text).
+        Goal: thinking events first, then the tool_use at the end.
+        """
+        data = b"".join([
+            aws_frames.reasoning("a"), aws_frames.reasoning("b"),
+            aws_frames.tool_start("Read", "toolu_2"),
+            aws_frames.tool_input('{"path": "x"}', "Read", "toolu_2"),
+        ])
+        _bytes_response(mock_response, [data])
+
+        events = await _collect_events(mock_response)
+
+        assert [e.type for e in events] == ["thinking", "thinking", "tool_use"]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_stream(self, mock_response, aws_frames):
+        """
+        What it does: Only reasoning frames.
+        Goal: Only thinking events; nothing else, no crash.
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("solo") + aws_frames.signature("QQ==")])
+        events = await _collect_events(mock_response)
+        assert [(e.type, e.thinking_content) for e in events] == [("thinking", "solo")]
+
+    @pytest.mark.asyncio
+    async def test_unknown_frames_only_yield_nothing(self, mock_response, aws_frames):
+        """
+        What it does: Only unrecognized frames.
+        Goal: No thinking events appear out of thin air.
+        """
+        _bytes_response(mock_response, [aws_frames.build("weirdEvent", {"foo": 1}) + aws_frames.metering(0.1)])
+        assert await _collect_events(mock_response) == []
+
+    @pytest.mark.asyncio
+    async def test_empty_text_frames_yield_no_events(self, mock_response, aws_frames):
+        """
+        What it does: Empty-string reasoning frames.
+        Goal: Skipped.
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("") + aws_frames.reasoning("")])
+        assert await _collect_events(mock_response) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled,thinking_flag", [(False, True), (True, False), (False, False)])
+    async def test_native_reasoning_ignores_fake_reasoning_switches(
+        self, mock_response, aws_frames, enabled, thinking_flag
+    ):
+        """
+        What it does: Disables FAKE_REASONING and/or enable_thinking_parser.
+        Goal: Native reasoning is still surfaced (those switches only control tag handling).
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("r1") + aws_frames.reasoning("r2")])
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", enabled):
+            events = await _collect_events(mock_response, enable_thinking_parser=thinking_flag)
+
+        assert [e.thinking_content for e in events] == ["r1", "r2"]
+
+    @pytest.mark.asyncio
+    async def test_remove_mode_drops_thinking_but_keeps_content(self, mock_response, aws_frames):
+        """
+        What it does: FAKE_REASONING_HANDLING=remove.
+        Goal: Zero thinking events; content untouched.
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("hidden") + aws_frames.content("shown")])
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "remove"):
+            events = await _collect_events(mock_response)
+
+        assert [e.type for e in events] == ["content"]
+        assert events[0].content == "shown"
+
+    @pytest.mark.asyncio
+    async def test_native_and_tag_reasoning_coexist(self, mock_response, aws_frames):
+        """
+        What it does: Native reasoning frames, then content that itself opens with <thinking>.
+        Goal: Both become thinking events (native flagged, tag-based not); answer is content.
+        """
+        data = (
+            aws_frames.reasoning("native")
+            + aws_frames.content("<thinking>tagged</thinking>answer")
+        )
+        _bytes_response(mock_response, [data])
+
+        events = await _collect_events(mock_response)
+
+        thinking = [e for e in events if e.type == "thinking"]
+        assert [(e.thinking_content, e.is_native_reasoning) for e in thinking] == [
+            ("native", True), ("tagged", False),
+        ]
+        assert "".join(e.content for e in events if e.type == "content") == "answer"
+
+    @pytest.mark.asyncio
+    async def test_debug_summary_has_counts_but_never_reasoning_text(
+        self, mock_response, aws_frames, loguru_messages
+    ):
+        """
+        What it does: Streams reasoning containing a secret marker and checks all log output.
+        Goal: One summary line with counts; the marker never appears in any log.
+        """
+        marker_text = f"{SECRET_MARKER} and more"
+        data = aws_frames.reasoning(marker_text) + aws_frames.reasoning("x") + aws_frames.signature("QQ==")
+        _bytes_response(mock_response, [data])
+
+        await _collect_events(mock_response)
+
+        joined = "\n".join(loguru_messages)
+        summaries = [m for m in loguru_messages if "[NativeReasoning]" in m]
+        print(f"Summaries: {summaries}")
+        assert len(summaries) == 1
+        assert "frames=2" in summaries[0]
+        assert f"chars={len(marker_text) + 1}" in summaries[0]
+        assert "signature_frames=1" in summaries[0]
+        assert SECRET_MARKER not in joined
+
+    @pytest.mark.asyncio
+    async def test_no_summary_without_native_reasoning(self, mock_response, aws_frames, loguru_messages):
+        """
+        What it does: Stream without reasoning frames.
+        Goal: No [NativeReasoning] log noise.
+        """
+        _bytes_response(mock_response, [aws_frames.content("plain")])
+        await _collect_events(mock_response)
+        assert not [m for m in loguru_messages if "[NativeReasoning]" in m]
+
+    @pytest.mark.asyncio
+    async def test_summary_still_logged_when_consumer_closes_early(
+        self, mock_response, aws_frames, loguru_messages
+    ):
+        """
+        What it does: Consumer closes the generator after the first event (client disconnect).
+        Goal: The finally block still logs the summary and the close completes cleanly.
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("a"), aws_frames.reasoning("b")])
+
+        agen = parse_kiro_stream(mock_response, first_token_timeout=30)
+        first = await agen.__anext__()
+        await agen.aclose()
+
+        assert first.thinking_content == "a"
+        assert any("[NativeReasoning]" in m and "frames=1" in m for m in loguru_messages)
+
+    @pytest.mark.asyncio
+    async def test_first_token_timeout_still_raised(self, mock_response):
+        """
+        What it does: First chunk never arrives.
+        Goal: FirstTokenTimeoutError still propagates (the new finally must not swallow it).
+        """
+        async def aiter_bytes():
+            yield b"x"
+
+        mock_response.aiter_bytes = aiter_bytes
+
+        async def timeout(*args, **kwargs):
+            raise asyncio.TimeoutError()
+
+        with patch("kiro.streaming_core.asyncio.wait_for", side_effect=timeout):
+            with pytest.raises(FirstTokenTimeoutError):
+                await _collect_events(mock_response)
+
+    @pytest.mark.asyncio
+    async def test_upstream_error_mid_stream_propagates_after_partial_reasoning(
+        self, mock_response, aws_frames
+    ):
+        """
+        What it does: Upstream raises after delivering some reasoning.
+        Goal: Earlier thinking events were already delivered and the error propagates.
+        """
+        async def aiter_bytes():
+            yield aws_frames.reasoning("before")
+            raise RuntimeError("boom")
+
+        mock_response.aiter_bytes = aiter_bytes
+        seen = []
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async for event in parse_kiro_stream(mock_response, first_token_timeout=30):
+                seen.append(event.thinking_content)
+
+        assert seen == ["before"]
+
+
+class TestCollectStreamToResultNativeReasoning:
+    """collect_stream_to_result() aggregation of native reasoning."""
+
+    @pytest.fixture(autouse=True)
+    def _config(self):
+        with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", True), \
+                patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_thinking_content_is_all_native_reasoning_concatenated(self, mock_response, aws_frames):
+        """
+        What it does: Collects a stream with reasoning, content, context usage.
+        Goal: thinking_content == concatenation of reasoning frames; usage fields preserved.
+        """
+        data = b"".join([
+            aws_frames.reasoning("one "), aws_frames.reasoning("two"),
+            aws_frames.content("answer"), aws_frames.context_usage(5.0),
+            aws_frames.build("usageEvent", {"usage": 0.25}),
+        ])
+        _bytes_response(mock_response, [data])
+
+        result = await collect_stream_to_result(mock_response, first_token_timeout=30)
+
+        assert result.thinking_content == "one two"
+        assert result.content == "answer"
+        assert result.context_usage_percentage == 5.0
+        assert result.usage == 0.25
+
+    @pytest.mark.asyncio
+    async def test_bracket_syntax_inside_native_reasoning_is_not_a_tool_call(self, mock_response, aws_frames):
+        """
+        What it does: Native reasoning quotes "[Called x with args: {...}]".
+        Goal: No tool call is fabricated from the model's inner monologue.
+        """
+        quote = '[Called evil_tool with args: {"a": 1}]'
+        _bytes_response(mock_response, [aws_frames.reasoning(quote) + aws_frames.content("done")])
+
+        result = await collect_stream_to_result(mock_response, first_token_timeout=30)
+
+        assert result.thinking_content == quote
+        assert result.tool_calls == []
+
+    @pytest.mark.asyncio
+    async def test_bracket_syntax_inside_tag_thinking_still_detected(self, mock_response, aws_frames):
+        """
+        What it does: Same quote inside a <thinking> tag block.
+        Goal: Historical behavior is locked - tag-based thinking is still scanned.
+        """
+        quote = '[Called legacy_tool with args: {"a": 1}]'
+        _bytes_response(mock_response, [aws_frames.content(f"<thinking>{quote}</thinking>ok")])
+
+        result = await collect_stream_to_result(mock_response, first_token_timeout=30)
+
+        assert [tc["function"]["name"] for tc in result.tool_calls] == ["legacy_tool"]
+
+    @pytest.mark.asyncio
+    async def test_remove_mode_yields_empty_thinking_content(self, mock_response, aws_frames):
+        """
+        What it does: FAKE_REASONING_HANDLING=remove.
+        Goal: thinking_content is empty; content kept.
+        """
+        _bytes_response(mock_response, [aws_frames.reasoning("hidden") + aws_frames.content("shown")])
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "remove"):
+            result = await collect_stream_to_result(mock_response, first_token_timeout=30)
+
+        assert result.thinking_content == ""
+        assert result.content == "shown"
+
+
+# ==================================================================================================
+# Empty upstream response guard
+# ==================================================================================================
+
+import httpx
+
+from kiro.streaming_core import (
+    STREAM_READY,
+    StreamReadyMarker,
+    guard_upstream_response,
+    prime_sse_stream,
+)
+from kiro.upstream_guard import (
+    EMPTY_SIGNATURE_MAX_BYTES,
+    EmptyUpstreamResponseError,
+    GuardedResponse,
+)
+
+
+def _stream_response(chunks):
+    """
+    Response double with a REAL one-shot byte stream (like httpx: aiter_bytes() works once).
+
+    Args:
+        chunks: List of bytes chunks, or exceptions to raise at that position
+
+    Returns:
+        AsyncMock response with status 200, aclose and a pull counter in `.pulled`
+    """
+    response = AsyncMock()
+    response.status_code = 200
+    response.aclose = AsyncMock()
+    response.pulled = []
+    state = {"calls": 0}
+
+    async def gen():
+        for chunk in chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            response.pulled.append(len(chunk))
+            yield chunk
+
+    def aiter_bytes(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] > 1:
+            raise httpx.StreamConsumed()
+        return gen()
+
+    response.aiter_bytes = aiter_bytes
+    return response
+
+
+def _hanging_response():
+    """Response double whose byte stream never produces a chunk (first token timeout)."""
+    response = AsyncMock()
+    response.status_code = 200
+    response.aclose = AsyncMock()
+
+    async def gen():
+        await asyncio.sleep(3600)
+        yield b""
+
+    response.aiter_bytes = lambda *a, **k: gen()
+    return response
+
+
+def _success_bytes(aws_frames):
+    """A realistic successful stream: reasoning, content, contextUsage, metering."""
+    return (
+        aws_frames.reasoning("Let me think") + aws_frames.reasoning(" more")
+        + aws_frames.content("Hello") + aws_frames.content(" world")
+        + aws_frames.context_usage(12.5) + aws_frames.metering(0.75)
+    )
+
+
+@pytest.fixture
+def guard_on():
+    """Enables the guard explicitly (it is also the default)."""
+    with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+        yield
+
+
+@pytest.mark.usefixtures("guard_on")
+class TestGuardUpstreamResponse:
+    """Tests for guard_upstream_response()."""
+
+    @pytest.mark.asyncio
+    async def test_context_usage_only_raises_empty_error(self, aws_frames):
+        """
+        What it does: Upstream stream is a single contextUsageEvent frame.
+        Purpose: The real failure shape must be rejected, with diagnostics attached.
+        """
+        frame = aws_frames.context_usage(60.73619842529297)
+        response = _stream_response([frame])
+
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await guard_upstream_response(response, first_token_timeout=5)
+
+        print(f"error: {exc_info.value}")
+        assert exc_info.value.bytes_received == len(frame)
+        assert exc_info.value.frame_counts == {"contextUsageEvent": 1}
+        response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_byte_stream_raises_empty_error(self):
+        """
+        What it does: Upstream stream ends without a single byte.
+        Purpose: No bytes means neither output nor metering.
+        """
+        response = _stream_response([])
+
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await guard_upstream_response(response, first_token_timeout=5)
+
+        assert exc_info.value.bytes_received == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_frame_split_across_chunks_raises(self, aws_frames):
+        """
+        What it does: The empty-response frame arrives in 1-byte chunks.
+        Purpose: Detection must not depend on network chunking.
+        """
+        frame = aws_frames.context_usage(60.7)
+        response = _stream_response(aws_frames.split(frame, [1]))
+
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await guard_upstream_response(response, first_token_timeout=5)
+
+        assert exc_info.value.frame_counts == {"contextUsageEvent": 1}
+
+    @pytest.mark.asyncio
+    async def test_metering_without_output_is_passed_through(self, aws_frames):
+        """
+        What it does: contextUsageEvent + meteringEvent, no output frame.
+        Purpose: A metered empty answer is the model's real answer: never an error.
+        """
+        data = aws_frames.context_usage(1.0) + aws_frames.metering(0.5)
+        response = _stream_response([data])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+        events = await _collect_events(guarded)
+        assert [e.type for e in events] == ["context_usage"]
+
+    @pytest.mark.asyncio
+    async def test_metering_split_across_chunks_is_passed_through(self, aws_frames):
+        """
+        What it does: The metering frame is split in the middle of its event type name.
+        Purpose: Boundary-split metering must still be recognised.
+        """
+        data = aws_frames.context_usage(1.0) + aws_frames.metering(0.5)
+        cut = data.index(b"meteringEvent") + 6
+        response = _stream_response([data[:cut], data[cut:]])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+
+    @pytest.mark.asyncio
+    async def test_reasoning_without_metering_is_passed_through(self, aws_frames):
+        """
+        What it does: reasoning frame + contextUsageEvent, no metering.
+        Purpose: Output exists; the response must be delivered.
+        """
+        data = aws_frames.reasoning("hmm") + aws_frames.context_usage(2.0)
+        response = _stream_response([data])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+        events = await _collect_events(guarded)
+
+        assert [e.type for e in events if e.type == "thinking"] == ["thinking"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sizes", [[1], [2], [7], [13], [50], [147], [165], [1000], [3, 1, 5, 200]])
+    async def test_guarded_events_equal_unguarded_events(self, aws_frames, sizes):
+        """
+        What it does: Runs the same stream through parse_kiro_stream with and without the guard,
+        for many chunk sizes.
+        Purpose: The guard must not lose, reorder or alter a single event.
+        """
+        data = _success_bytes(aws_frames)
+        chunks = aws_frames.split(data, sizes)
+        baseline = await _collect_events(_stream_response(chunks))
+
+        guarded = await guard_upstream_response(_stream_response(chunks), first_token_timeout=5)
+        replayed = await _collect_events(guarded)
+
+        assert [asdict(e) for e in replayed] == [asdict(e) for e in baseline]
+        assert any(e.type == "content" for e in replayed)
+
+    @pytest.mark.asyncio
+    async def test_first_output_frame_releases_without_reading_more(self, aws_frames):
+        """
+        What it does: Counts upstream pulls after the first content frame arrived.
+        Purpose: The guard must not delay a real response (no extra buffering/waiting).
+        """
+        chunks = [aws_frames.content("a"), aws_frames.content("b"), aws_frames.content("c")]
+        response = _stream_response(chunks)
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+        assert len(response.pulled) == 1
+
+    @pytest.mark.asyncio
+    async def test_neutral_first_chunk_keeps_reading_until_output(self, aws_frames):
+        """
+        What it does: contextUsageEvent arrives first, content later (hypothetical ordering).
+        Purpose: Only output/metering/unknown frames release; neutral frames keep peeking.
+        """
+        response = _stream_response([aws_frames.context_usage(1.0), aws_frames.content("late")])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+        events = await _collect_events(guarded)
+
+        assert [e.content for e in events if e.type == "content"] == ["late"]
+
+    @pytest.mark.asyncio
+    async def test_size_cap_releases_neutral_only_stream(self, aws_frames):
+        """
+        What it does: Neutral frames beyond EMPTY_SIGNATURE_MAX_BYTES, then the stream goes on.
+        Purpose: The buffer stays bounded and large streams are never "empty".
+        """
+        frame = aws_frames.context_usage(1.0)
+        count = EMPTY_SIGNATURE_MAX_BYTES // len(frame) + 2
+        response = _stream_response([frame] * count + [aws_frames.content("x")])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_framing_is_passed_through_with_warning(self, loguru_messages):
+        """
+        What it does: Stream of bare JSON with no AWS frame headers.
+        Purpose: When the protocol changes the guard must step aside, and say so.
+        """
+        response = _stream_response([b'{"content":"Hello"}'])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+        assert any("no AWS event-stream frame header recognised" in m for m in loguru_messages)
+
+    @pytest.mark.asyncio
+    async def test_first_chunk_timeout_raises_first_token_timeout(self):
+        """
+        What it does: The upstream never sends a first chunk.
+        Purpose: FIRST_TOKEN_TIMEOUT keeps its meaning.
+        """
+        response = _hanging_response()
+
+        with pytest.raises(FirstTokenTimeoutError):
+            await guard_upstream_response(response, first_token_timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_no_timeout_applies_after_first_chunk(self, aws_frames):
+        """
+        What it does: Second chunk is slower than first_token_timeout.
+        Purpose: Only the FIRST chunk is subject to the timeout (as in parse_kiro_stream).
+        """
+        frame = aws_frames.context_usage(1.0)
+        response = AsyncMock()
+        response.aclose = AsyncMock()
+
+        async def gen():
+            yield frame[:10]
+            await asyncio.sleep(0.2)
+            yield frame[10:]
+
+        response.aiter_bytes = lambda *a, **k: gen()
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            await guard_upstream_response(response, first_token_timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_read_error_before_stream_end_propagates_unchanged(self, aws_frames):
+        """
+        What it does: Network error after a partial empty-looking prefix.
+        Purpose: A failed read is not an empty response; the original error must surface.
+        """
+        frame = aws_frames.context_usage(1.0)
+        response = _stream_response([frame, httpx.ReadError("connection reset")])
+
+        with pytest.raises(httpx.ReadError):
+            await guard_upstream_response(response, first_token_timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_read_error_on_first_chunk_propagates_unchanged(self):
+        """
+        What it does: The very first read fails.
+        Purpose: Same as above for the first chunk.
+        """
+        response = _stream_response([httpx.ReadError("boom")])
+
+        with pytest.raises(httpx.ReadError):
+            await guard_upstream_response(response, first_token_timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_disabled_returns_original_and_reads_nothing(self, aws_frames):
+        """
+        What it does: enabled=False with an empty-response stream.
+        Purpose: With the switch off the response must be untouched (native behavior).
+        """
+        response = _stream_response([aws_frames.context_usage(1.0)])
+
+        result = await guard_upstream_response(response, first_token_timeout=5, enabled=False)
+
+        assert result is response
+        assert response.pulled == []
+
+    @pytest.mark.asyncio
+    async def test_config_default_is_read_at_call_time(self, aws_frames):
+        """
+        What it does: Patches the module level EMPTY_RESPONSE_AS_ERROR to False.
+        Purpose: The config flag controls the guard when `enabled` is not passed.
+        """
+        response = _stream_response([aws_frames.context_usage(1.0)])
+
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            result = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert result is response
+
+    @pytest.mark.asyncio
+    async def test_aiter_bytes_of_original_response_called_once(self, aws_frames):
+        """
+        What it does: Guard + full parse over a real one-shot stream (StreamConsumed on 2nd call).
+        Purpose: The replay wrapper must never ask httpx for a second iterator.
+        """
+        response = _stream_response([_success_bytes(aws_frames)])
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+        events = await _collect_events(guarded)
+
+        assert events
+
+
+async def _sse_processor(response):
+    """stream_processor double: yields one SSE-like string per content event."""
+    async for event in parse_kiro_stream(response, first_token_timeout=30):
+        if event.type == "content":
+            yield f"data:{event.content}"
+
+
+@pytest.mark.usefixtures("guard_on")
+class TestFirstTokenRetryWithGuard:
+    """The guard lives inside stream_with_first_token_retry attempts."""
+
+    @pytest.mark.asyncio
+    async def test_ready_marker_then_chunks(self, aws_frames):
+        """
+        What it does: emit_ready_marker=True with a normal response.
+        Purpose: Exactly one STREAM_READY, before all SSE chunks, content complete.
+        """
+        response = _stream_response(aws_frames.split(_success_bytes(aws_frames), [11]))
+
+        items = [
+            item async for item in stream_with_first_token_retry(
+                make_request=AsyncMock(), stream_processor=_sse_processor,
+                initial_response=response, max_retries=3, first_token_timeout=5,
+                emit_ready_marker=True,
+            )
+        ]
+
+        print(items)
+        assert items[0] is STREAM_READY
+        assert items[1:] == ["data:Hello", "data: world"]
+        assert sum(1 for i in items if isinstance(i, StreamReadyMarker)) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_marker_by_default(self, aws_frames):
+        """
+        What it does: emit_ready_marker left at its default.
+        Purpose: Existing callers must not see a sentinel.
+        """
+        response = _stream_response([_success_bytes(aws_frames)])
+
+        items = [
+            item async for item in stream_with_first_token_retry(
+                make_request=AsyncMock(), stream_processor=_sse_processor,
+                initial_response=response, max_retries=3, first_token_timeout=5,
+            )
+        ]
+
+        assert all(isinstance(i, str) for i in items)
+        assert items == ["data:Hello", "data: world"]
+
+    @pytest.mark.asyncio
+    async def test_empty_response_raises_before_any_item_and_is_not_retried(self, aws_frames):
+        """
+        What it does: initial response is a lone contextUsageEvent frame.
+        Purpose: EmptyUpstreamResponseError surfaces with nothing yielded and make_request
+        untouched (no gateway-side retry).
+        """
+        response = _stream_response([aws_frames.context_usage(1.0)])
+        make_request = AsyncMock()
+        items = []
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            async for item in stream_with_first_token_retry(
+                make_request=make_request, stream_processor=_sse_processor,
+                initial_response=response, max_retries=3, first_token_timeout=5,
+                emit_ready_marker=True,
+            ):
+                items.append(item)
+
+        assert items == []
+        make_request.assert_not_called()
+        response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_response_logs_no_error_level(self, aws_frames, loguru_messages):
+        """
+        What it does: Empty response through the retry loop.
+        Purpose: It is an expected condition: no ERROR line, no stack trace.
+        """
+        response = _stream_response([aws_frames.context_usage(1.0)])
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            async for _ in stream_with_first_token_retry(
+                make_request=AsyncMock(), stream_processor=_sse_processor,
+                initial_response=response, max_retries=3, first_token_timeout=5,
+            ):
+                pass
+
+        assert not [m for m in loguru_messages if m.startswith("ERROR|")]
+
+    @pytest.mark.asyncio
+    async def test_timeout_in_guard_is_retried_then_succeeds(self, aws_frames):
+        """
+        What it does: Attempt 1 hangs (guard timeout), attempt 2 is a normal response.
+        Purpose: FIRST_TOKEN_TIMEOUT retry works exactly as before, marker emitted once.
+        """
+        hanging = _hanging_response()
+        good = _stream_response([_success_bytes(aws_frames)])
+        make_request = AsyncMock(return_value=good)
+
+        items = [
+            item async for item in stream_with_first_token_retry(
+                make_request=make_request, stream_processor=_sse_processor,
+                initial_response=hanging, max_retries=3, first_token_timeout=0.05,
+                emit_ready_marker=True,
+            )
+        ]
+
+        assert items[0] is STREAM_READY
+        assert items[1:] == ["data:Hello", "data: world"]
+        assert make_request.await_count == 1
+        hanging.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_then_empty_response_raises_empty_error(self, aws_frames):
+        """
+        What it does: Attempt 1 times out, the retried response is empty.
+        Purpose: The retried response is peeked too; empty error, nothing yielded, both closed.
+        """
+        hanging = _hanging_response()
+        empty = _stream_response([aws_frames.context_usage(1.0)])
+        make_request = AsyncMock(return_value=empty)
+        items = []
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            async for item in stream_with_first_token_retry(
+                make_request=make_request, stream_processor=_sse_processor,
+                initial_response=hanging, max_retries=3, first_token_timeout=0.05,
+                emit_ready_marker=True,
+            ):
+                items.append(item)
+
+        assert items == []
+        hanging.aclose.assert_awaited()
+        empty.aclose.assert_awaited()
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_all_attempts_timing_out_keeps_old_error_semantics(self):
+        """
+        What it does: Every attempt hangs.
+        Purpose: on_all_retries_failed is invoked after max_retries attempts, as before.
+        """
+        make_request = AsyncMock(side_effect=lambda: _hanging_response())
+        calls = []
+
+        def on_all_failed(retries, timeout):
+            calls.append((retries, timeout))
+            return RuntimeError("all failed")
+
+        with pytest.raises(RuntimeError, match="all failed"):
+            async for _ in stream_with_first_token_retry(
+                make_request=make_request, stream_processor=_sse_processor,
+                initial_response=_hanging_response(), max_retries=3, first_token_timeout=0.02,
+                on_all_retries_failed=on_all_failed, emit_ready_marker=True,
+            ):
+                pass
+
+        assert calls == [(3, 0.02)]
+        assert make_request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_emits_marker_before_first_token_wait(self, aws_frames):
+        """
+        What it does: empty_response_as_error=False with an empty-looking stream.
+        Purpose: Native behavior: marker immediately, empty stream passes through without error.
+        """
+        response = _stream_response([aws_frames.context_usage(1.0)])
+
+        items = [
+            item async for item in stream_with_first_token_retry(
+                make_request=AsyncMock(), stream_processor=_sse_processor,
+                initial_response=response, max_retries=3, first_token_timeout=5,
+                emit_ready_marker=True, empty_response_as_error=False,
+            )
+        ]
+
+        assert items == [STREAM_READY]
+
+    @pytest.mark.asyncio
+    async def test_closing_after_marker_closes_response(self, aws_frames):
+        """
+        What it does: Consumer closes the generator right after receiving STREAM_READY.
+        Purpose: The accepted response must not leak when no stream processor ever ran.
+        """
+        response = _stream_response([_success_bytes(aws_frames)])
+        stream = stream_with_first_token_retry(
+            make_request=AsyncMock(), stream_processor=_sse_processor,
+            initial_response=response, max_retries=3, first_token_timeout=5,
+            emit_ready_marker=True,
+        )
+
+        assert await stream.__anext__() is STREAM_READY
+        await stream.aclose()
+
+        response.aclose.assert_awaited()
+
+
+class TestPrimeSseStream:
+    """Tests for prime_sse_stream()."""
+
+    @staticmethod
+    def _source(items, after_error=None):
+        """Async generator yielding items; raises `after_error` at the end if given."""
+        closed = {"value": False}
+
+        async def gen():
+            try:
+                for item in items:
+                    yield item
+                if after_error is not None:
+                    raise after_error
+            finally:
+                closed["value"] = True
+
+        inner = gen()
+
+        class Source:
+            """Async generator facade exposing the `closed` flag."""
+
+            def __init__(self):
+                self.closed = closed
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await inner.__anext__()
+
+            async def aclose(self):
+                await inner.aclose()
+
+        return Source()
+
+    @pytest.mark.asyncio
+    async def test_drops_marker_and_replays_rest_in_order(self):
+        """
+        What it does: Stream starts with STREAM_READY.
+        Purpose: The marker must never reach the client; everything else in order.
+        """
+        primed = await prime_sse_stream(self._source([STREAM_READY, "a", "b", "c"]))
+
+        assert [item async for item in primed] == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_first_string_item_is_kept(self):
+        """
+        What it does: Stream without marker (first item is an SSE string).
+        Purpose: The first chunk must be replayed, not dropped.
+        """
+        primed = await prime_sse_stream(self._source(["a", "b"]))
+
+        assert [item async for item in primed] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_empty_stream(self):
+        """
+        What it does: Stream ends immediately.
+        Purpose: An empty generator is returned, no exception.
+        """
+        primed = await prime_sse_stream(self._source([]))
+
+        assert [item async for item in primed] == []
+
+    @pytest.mark.asyncio
+    async def test_marker_only_stream(self):
+        """
+        What it does: Only the marker, then end.
+        Purpose: Nothing is replayed.
+        """
+        primed = await prime_sse_stream(self._source([STREAM_READY]))
+
+        assert [item async for item in primed] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_error_is_raised_immediately(self):
+        """
+        What it does: Stream raises EmptyUpstreamResponseError at the first step.
+        Purpose: Routes need it before the StreamingResponse exists.
+        """
+        source = self._source([], after_error=EmptyUpstreamResponseError(147, {"contextUsageEvent": 1}))
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            await prime_sse_stream(source)
+
+    @pytest.mark.asyncio
+    async def test_other_exception_is_deferred_to_iteration(self):
+        """
+        What it does: Stream raises a generic error at the first step.
+        Purpose: Existing route behavior (in-stream error event) must stay: raised on iteration.
+        """
+        source = self._source([], after_error=RuntimeError("upstream broke"))
+
+        primed = await prime_sse_stream(source)
+
+        with pytest.raises(RuntimeError, match="upstream broke"):
+            async for _ in primed:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_deferred_exception_raised_only_once(self):
+        """
+        What it does: Iterates a primed stream twice after a deferred error.
+        Purpose: The error surfaces once; a finished generator is simply exhausted.
+        """
+        primed = await prime_sse_stream(self._source([], after_error=RuntimeError("x")))
+
+        with pytest.raises(RuntimeError):
+            await primed.__anext__()
+        with pytest.raises(StopAsyncIteration):
+            await primed.__anext__()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_closes_stream_and_propagates(self):
+        """
+        What it does: Stream raises CancelledError while priming.
+        Purpose: Cancellation must propagate and the source must be closed.
+        """
+        source = self._source([], after_error=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await prime_sse_stream(source)
+
+        assert source.closed["value"] is True
+
+    @pytest.mark.asyncio
+    async def test_closing_primed_stream_closes_source(self):
+        """
+        What it does: Consumer stops after the first item and closes the primed generator.
+        Purpose: Client disconnect must reach the source generator's cleanup.
+        """
+        source = self._source([STREAM_READY, "a", "b", "c"])
+        primed = await prime_sse_stream(source)
+
+        assert await primed.__anext__() == "a"
+        await primed.aclose()
+
+        assert source.closed["value"] is True
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_error_propagates_after_items(self):
+        """
+        What it does: Source yields two items then fails.
+        Purpose: Items first, then the error (route turns it into an SSE error event).
+        """
+        source = self._source([STREAM_READY, "a", "b"], after_error=RuntimeError("late"))
+        primed = await prime_sse_stream(source)
+        seen = []
+
+        with pytest.raises(RuntimeError, match="late"):
+            async for item in primed:
+                seen.append(item)
+
+        assert seen == ["a", "b"]
+
+
+@pytest.mark.usefixtures("guard_on")
+class TestCollectStreamToResultGuard:
+    """collect_stream_to_result() with the empty-response guard."""
+
+    @pytest.mark.asyncio
+    async def test_empty_response_raises(self, aws_frames):
+        """
+        What it does: Non-streaming collection of a lone contextUsageEvent frame.
+        Purpose: Non-streaming path reports the empty upstream response too.
+        """
+        response = _stream_response([aws_frames.context_usage(60.7)])
+
+        with pytest.raises(EmptyUpstreamResponseError):
+            await collect_stream_to_result(response, first_token_timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_metered_empty_answer_returns_empty_result(self, aws_frames):
+        """
+        What it does: contextUsageEvent + meteringEvent, no output.
+        Purpose: The model's empty answer is delivered as an empty result (no error).
+        """
+        response = _stream_response([aws_frames.context_usage(3.0) + aws_frames.metering(0.1)])
+
+        result = await collect_stream_to_result(response, first_token_timeout=5)
+
+        assert result.content == ""
+        assert result.tool_calls == []
+        assert result.context_usage_percentage == 3.0
+
+    @pytest.mark.asyncio
+    async def test_normal_response_unchanged(self, aws_frames):
+        """
+        What it does: Normal reasoning + content response in awkward chunks.
+        Purpose: Collected result equals the one without the guard.
+        """
+        chunks = aws_frames.split(_success_bytes(aws_frames), [5, 9])
+        guarded = await collect_stream_to_result(_stream_response(chunks), first_token_timeout=5)
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            unguarded = await collect_stream_to_result(_stream_response(chunks), first_token_timeout=5)
+
+        assert asdict(guarded) == asdict(unguarded)
+        assert guarded.content == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_tool_only_response(self, aws_frames):
+        """
+        What it does: A tool call response (no text).
+        Purpose: Tool-only output is output.
+        """
+        data = (
+            aws_frames.tool_start("get_weather", "tool_1")
+            + aws_frames.tool_input('{"city":"Paris"}', "get_weather", "tool_1")
+            + aws_frames.tool_stop("get_weather", "tool_1")
+            + aws_frames.context_usage(2.0) + aws_frames.metering(0.2)
+        )
+
+        result = await collect_stream_to_result(_stream_response([data]), first_token_timeout=5)
+
+        assert len(result.tool_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_switch_off_returns_empty_result(self, aws_frames):
+        """
+        What it does: EMPTY_RESPONSE_AS_ERROR=False with an empty upstream response.
+        Purpose: Native behavior is restored: empty result, no error.
+        """
+        response = _stream_response([aws_frames.context_usage(60.7)])
+
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            result = await collect_stream_to_result(response, first_token_timeout=5)
+
+        assert result.content == ""
+
+
+class TestParseKiroStreamDiagnostics:
+    """[StreamFrames] and [FirstToken] diagnostics."""
+
+    @pytest.mark.asyncio
+    async def test_stream_frames_log_is_exact_across_chunk_boundaries(self, aws_frames, loguru_messages):
+        """
+        What it does: Parses a stream cut into 3-byte chunks.
+        Purpose: [StreamFrames] counts must be exact even when headers are split.
+        """
+        data = _success_bytes(aws_frames)
+        response = _stream_response(aws_frames.split(data, [3]))
+
+        await _collect_events(response)
+
+        line = next(m for m in loguru_messages if "[StreamFrames]" in m)
+        print(line)
+        assert f"bytes={len(data)}" in line
+        assert "'reasoningContentEvent': 2" in line
+        assert "'assistantResponseEvent': 2" in line
+        assert "'contextUsageEvent': 1" in line
+        assert "'meteringEvent': 1" in line
+
+    @pytest.mark.asyncio
+    async def test_first_token_log_uses_guard_measured_time(self, aws_frames, loguru_messages):
+        """
+        What it does: Parses a GuardedResponse whose first chunk took a known time.
+        Purpose: The replay is instant; the log must show the real upstream wait.
+        """
+        response = _stream_response([_success_bytes(aws_frames)])
+        guarded = await guard_upstream_response(response, first_token_timeout=5, enabled=True)
+        guarded.first_chunk_ms = 1234.0
+
+        await _collect_events(guarded)
+
+        assert any("[FirstToken] received in 1234ms" in m for m in loguru_messages)
+
+    def test_count_frame_event_types_still_counts_single_chunk(self, aws_frames):
+        """
+        What it does: Calls the legacy diagnostics helper on one chunk.
+        Purpose: The public helper keeps working.
+        """
+        from collections import Counter
+        from kiro.streaming_core import count_frame_event_types
+
+        counts = Counter()
+        count_frame_event_types(aws_frames.content("a") + aws_frames.metering(1.0), counts)
+
+        assert dict(counts) == {"assistantResponseEvent": 1, "meteringEvent": 1}
+
+
+@pytest.mark.usefixtures("guard_on")
+class TestGuardReleasesOnFirstToolFrame:
+    """A pure tool-call response must not wait for the end of the stream."""
+
+    @pytest.mark.asyncio
+    async def test_first_tool_use_frame_releases_without_reading_more(self, aws_frames):
+        """
+        What it does: Upstream sends toolUseEvent frames in separate chunks; counts pulls.
+        Purpose: Tool-only responses stream their first byte as soon as the first
+        toolUseEvent header is seen (the guard does not wait for the stream end).
+        """
+        chunks = [
+            aws_frames.tool_start("Bash", "t1"),
+            aws_frames.tool_input('{"command": "ls"}', "Bash", "t1"),
+            aws_frames.tool_stop("Bash", "t1"),
+            aws_frames.context_usage(1.0),
+        ]
+        response = _stream_response(chunks)
+
+        guarded = await guard_upstream_response(response, first_token_timeout=5)
+
+        assert isinstance(guarded, GuardedResponse)
+        assert len(response.pulled) == 1
+        events = await _collect_events(guarded)
+        assert [e.type for e in events if e.type == "tool_use"] == ["tool_use"]
+
+
+# ==================================================================================================
+# Incomplete upstream response (reasoning only, no meteringEvent, no text, no tool_use)
+# ==================================================================================================
+
+from kiro.streaming_core import (  # noqa: E402
+    aclose_shielded,
+    check_stream_outcome,
+)
+from kiro.upstream_guard import (  # noqa: E402
+    KIND_INCOMPLETE,
+    StreamOutcome,
+    StreamVerdict,
+)
+
+BODY_SECRET = "SECRET_BODY_TEXT_91c2"
+THOUGHT_SECRET = "SECRET_THOUGHT_TEXT_55d1"
+
+
+@pytest.fixture
+def pinned_reasoning():
+    """Pins native reasoning handling so tests do not depend on the local .env."""
+    with patch("kiro.streaming_core.FAKE_REASONING_ENABLED", True), \
+            patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+        yield
+
+
+def incomplete_bytes(aws_frames, with_context_usage=True):
+    """Reasoning frames (+ contextUsageEvent), no metering, no body: the reported failure."""
+    data = b"".join(aws_frames.reasoning(f"{THOUGHT_SECRET} {i}") for i in range(5))
+    if with_context_usage:
+        data += aws_frames.context_usage(3.5)
+    return data
+
+
+@pytest.mark.usefixtures("pinned_reasoning")
+class TestParseKiroStreamOutcome:
+    """parse_kiro_stream fills the StreamOutcome side channel."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_context_usage_without_metering_is_incomplete(self, aws_frames):
+        """
+        What it does: Parses the reported failure shape with an outcome.
+        Purpose: verdict INCOMPLETE; no text, no tool_use; frame counts from the ONE scanner.
+        """
+        data = incomplete_bytes(aws_frames)
+        outcome = StreamOutcome()
+
+        events = await _collect_events(_stream_response([data]), outcome=outcome)
+
+        assert [e.type for e in events] == ["thinking"] * 5 + ["context_usage"]
+        assert outcome.finished is True
+        assert outcome.verdict() == StreamVerdict.INCOMPLETE
+        assert outcome.produced_text is False and outcome.produced_tool_use is False
+        assert dict(outcome.scanner.counts) == {"reasoningContentEvent": 5, "contextUsageEvent": 1}
+        assert outcome.scanner.bytes_received == len(data)
+
+    @pytest.mark.asyncio
+    async def test_metering_makes_it_complete(self, aws_frames):
+        """
+        What it does: Same stream plus a meteringEvent.
+        Purpose: verdict COMPLETE (pass through verbatim).
+        """
+        outcome = StreamOutcome()
+
+        await _collect_events(
+            _stream_response([incomplete_bytes(aws_frames) + aws_frames.metering(0.4)]), outcome=outcome
+        )
+
+        assert outcome.verdict() == StreamVerdict.COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_body_without_metering(self, aws_frames):
+        """
+        What it does: Reasoning + text, no metering.
+        Purpose: verdict MISSING_METERING_WITH_OUTPUT with produced_text.
+        """
+        outcome = StreamOutcome()
+
+        await _collect_events(
+            _stream_response([aws_frames.reasoning("r") + aws_frames.content("hi")]), outcome=outcome
+        )
+
+        assert outcome.verdict() == StreamVerdict.MISSING_METERING_WITH_OUTPUT
+        assert outcome.produced_text is True
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_tool_use_without_metering(self, aws_frames):
+        """
+        What it does: Reasoning + a complete tool call, no metering.
+        Purpose: produced_tool_use is recorded; verdict MISSING_METERING_WITH_OUTPUT.
+        """
+        data = (
+            aws_frames.reasoning("r")
+            + aws_frames.tool_start("Bash", "toolu_1")
+            + aws_frames.tool_input('{"command": "ls"}', "Bash", "toolu_1")
+            + aws_frames.tool_stop("Bash", "toolu_1")
+        )
+        outcome = StreamOutcome()
+
+        await _collect_events(_stream_response([data]), outcome=outcome)
+
+        assert outcome.produced_tool_use is True
+        assert outcome.verdict() == StreamVerdict.MISSING_METERING_WITH_OUTPUT
+
+    @pytest.mark.asyncio
+    async def test_only_reasoning_frames_no_context_usage(self, aws_frames):
+        """
+        What it does: 49 reasoning frames only (the 17:15:07 shape).
+        Purpose: INCOMPLETE even without a contextUsageEvent.
+        """
+        data = b"".join(aws_frames.reasoning(f"thought {i} " * 4) for i in range(49))
+        outcome = StreamOutcome()
+
+        await _collect_events(_stream_response([data]), outcome=outcome)
+
+        assert outcome.scanner.counts["reasoningContentEvent"] == 49
+        assert outcome.verdict() == StreamVerdict.INCOMPLETE
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_is_finished_with_no_output_frames(self):
+        """
+        What it does: Upstream stream with no bytes at all (guard disabled).
+        Purpose: Early return still marks the stream finished; verdict NO_OUTPUT_FRAMES.
+        """
+        outcome = StreamOutcome()
+
+        events = await _collect_events(_stream_response([]), outcome=outcome)
+
+        assert events == []
+        assert outcome.finished is True
+        assert outcome.verdict() == StreamVerdict.NO_OUTPUT_FRAMES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [
+        httpx.ReadError("connection reset"),
+        httpx.RemoteProtocolError("peer closed connection without sending complete message body"),
+    ])
+    async def test_mid_stream_exception_is_not_finished(self, aws_frames, error):
+        """
+        What it does: The upstream raises after some reasoning frames.
+        Purpose: finished stays False -> NOT_FINISHED; the exception propagates unchanged.
+        """
+        outcome = StreamOutcome()
+        response = _stream_response([aws_frames.reasoning("r"), error])
+
+        with pytest.raises(type(error)):
+            await _collect_events(response, outcome=outcome)
+
+        assert outcome.finished is False
+        assert outcome.verdict() == StreamVerdict.NOT_FINISHED
+
+    @pytest.mark.asyncio
+    async def test_consumer_close_is_not_finished(self, aws_frames):
+        """
+        What it does: The consumer closes the generator after the first event (GeneratorExit).
+        Purpose: finished stays False: no verdict for an abandoned stream.
+        """
+        outcome = StreamOutcome()
+        response = _stream_response([aws_frames.reasoning("a"), aws_frames.reasoning("b")])
+        gen = parse_kiro_stream(response, first_token_timeout=30, outcome=outcome)
+
+        await gen.__anext__()
+        await gen.aclose()
+
+        assert outcome.finished is False
+        assert outcome.verdict() == StreamVerdict.NOT_FINISHED
+
+    @pytest.mark.asyncio
+    async def test_events_are_identical_with_and_without_outcome(self, aws_frames):
+        """
+        What it does: Parses the same bytes with and without an outcome.
+        Purpose: The outcome is a pure side channel: the event sequence does not change.
+        """
+        data = _success_bytes(aws_frames)
+
+        with_outcome = await _collect_events(_stream_response([data]), outcome=StreamOutcome())
+        without = await _collect_events(_stream_response([data]))
+
+        assert with_outcome == without
+
+    @pytest.mark.asyncio
+    async def test_guard_replay_counts_the_whole_stream_with_one_scanner(self, aws_frames):
+        """
+        What it does: Runs the guard first (it peeks), then parses the GuardedResponse.
+        Purpose: outcome.scanner counts exactly the bytes/frames of the whole stream, equal to
+        the unguarded result: peeked bytes are not lost and not counted twice.
+        """
+        data = incomplete_bytes(aws_frames)
+        chunks = aws_frames.split(data, [13, 70])
+        guarded_outcome = StreamOutcome()
+        plain_outcome = StreamOutcome()
+        guarded = await guard_upstream_response(_stream_response(chunks), 5, True)
+
+        await _collect_events(guarded, outcome=guarded_outcome)
+        await _collect_events(_stream_response(chunks), outcome=plain_outcome)
+
+        assert isinstance(guarded, GuardedResponse)
+        assert guarded_outcome.scanner.bytes_received == plain_outcome.scanner.bytes_received == len(data)
+        assert dict(guarded_outcome.scanner.counts) == dict(plain_outcome.scanner.counts)
+        assert guarded_outcome.verdict() == plain_outcome.verdict() == StreamVerdict.INCOMPLETE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handling", ["include_as_text", "strip_tags", "pass", "remove", "as_reasoning_content"])
+    async def test_reasoning_never_counts_as_text_in_any_mode(self, aws_frames, handling):
+        """
+        What it does: Reasoning-only stream under every FAKE_REASONING_HANDLING mode.
+        Purpose: Mode changes formatting, never the verdict: always INCOMPLETE, never text.
+        """
+        outcome = StreamOutcome()
+
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", handling):
+            await _collect_events(_stream_response([incomplete_bytes(aws_frames)]), outcome=outcome)
+
+        assert outcome.produced_text is False
+        assert outcome.verdict() == StreamVerdict.INCOMPLETE
+
+    @pytest.mark.asyncio
+    async def test_exception_frame_without_output_is_incomplete(self, aws_frames):
+        """
+        What it does: AWS exception frame + contextUsageEvent through the real parser.
+        Purpose: The parser tolerates the frame and the verdict is INCOMPLETE.
+        """
+        data = aws_frames.exception("ThrottlingException", {"message": "x"}) + aws_frames.context_usage(1.0)
+        outcome = StreamOutcome()
+
+        await _collect_events(_stream_response([data]), outcome=outcome)
+
+        assert outcome.verdict() == StreamVerdict.INCOMPLETE
+
+
+class TestCheckStreamOutcome:
+    """check_stream_outcome(): switch semantics and WARNING content."""
+
+    @staticmethod
+    def _outcome(aws_frames, kind):
+        """Builds a finished StreamOutcome of the requested verdict."""
+        outcome = StreamOutcome()
+        if kind == "incomplete":
+            outcome.scanner.feed(incomplete_bytes(aws_frames))
+        elif kind == "complete":
+            outcome.scanner.feed(incomplete_bytes(aws_frames) + aws_frames.metering(0.1))
+        elif kind == "missing_metering":
+            outcome.scanner.feed(aws_frames.reasoning(THOUGHT_SECRET) + aws_frames.content(BODY_SECRET))
+            outcome.produced_text = True
+        elif kind == "no_output":
+            outcome.scanner.feed(aws_frames.context_usage(1.0))
+        outcome.finished = kind != "not_finished"
+        if kind == "not_finished":
+            outcome.scanner.feed(incomplete_bytes(aws_frames))
+        return outcome
+
+    def test_incomplete_with_switch_on_requires_error(self, aws_frames, loguru_messages):
+        """
+        What it does: INCOMPLETE, switch on.
+        Purpose: Returns True; logs nothing itself (the caller reports the error once).
+        """
+        assert check_stream_outcome(self._outcome(aws_frames, "incomplete"), enabled=True) is True
+        assert not [m for m in loguru_messages if "IncompleteUpstreamResponse" in m]
+
+    def test_incomplete_with_switch_off_passes_through_with_warning(self, aws_frames, loguru_messages):
+        """
+        What it does: INCOMPLETE, switch off.
+        Purpose: Returns False (old behavior) but leaves one diagnostic WARNING.
+        """
+        assert check_stream_outcome(self._outcome(aws_frames, "incomplete"), enabled=False) is False
+
+        lines = [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+        assert len(lines) == 1 and lines[0].startswith("WARNING|")
+        assert "action=passthrough" in lines[0]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_missing_metering_with_output_warns_whatever_the_switch(self, aws_frames, loguru_messages, enabled):
+        """
+        What it does: Text without metering (possibly truncated), both switch states.
+        Purpose: Never an error; one WARNING with counts/booleans and NO content.
+        """
+        outcome = self._outcome(aws_frames, "missing_metering")
+
+        assert check_stream_outcome(outcome, enabled=enabled) is False
+
+        lines = [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+        assert len(lines) == 1 and lines[0].startswith("WARNING|")
+        assert "text=True" in lines[0] and "tool_use=False" in lines[0]
+        assert "upstream_bytes=" in lines[0] and "reasoningContentEvent" in lines[0]
+        assert BODY_SECRET not in lines[0] and THOUGHT_SECRET not in lines[0]
+
+    @pytest.mark.parametrize("kind", ["complete", "no_output", "not_finished"])
+    def test_other_verdicts_are_silent_passthrough(self, aws_frames, loguru_messages, kind):
+        """
+        What it does: COMPLETE / NO_OUTPUT_FRAMES / NOT_FINISHED.
+        Purpose: Returns False and writes no [IncompleteUpstreamResponse] line.
+        """
+        assert check_stream_outcome(self._outcome(aws_frames, kind), enabled=True) is False
+        assert not [m for m in loguru_messages if "IncompleteUpstreamResponse" in m]
+
+    def test_enabled_none_reads_the_config(self, aws_frames):
+        """
+        What it does: enabled=None with the module setting patched both ways.
+        Purpose: The config value is the default.
+        """
+        outcome = self._outcome(aws_frames, "incomplete")
+        with patch("kiro.streaming_core.INCOMPLETE_RESPONSE_AS_ERROR", True):
+            assert check_stream_outcome(outcome) is True
+        with patch("kiro.streaming_core.INCOMPLETE_RESPONSE_AS_ERROR", False):
+            assert check_stream_outcome(outcome) is False
+
+
+@pytest.mark.usefixtures("pinned_reasoning", "guard_on")
+class TestCollectStreamToResultIncomplete:
+    """collect_stream_to_result() with the incomplete-response criterion."""
+
+    @pytest.mark.asyncio
+    async def test_incomplete_raises_with_diagnostics(self, aws_frames):
+        """
+        What it does: Non-streaming collection of reasoning + contextUsageEvent, no metering.
+        Purpose: Raises EmptyUpstreamResponseError(kind=incomplete) with the stream facts.
+        """
+        data = incomplete_bytes(aws_frames)
+
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await collect_stream_to_result(_stream_response([data]), first_token_timeout=5)
+
+        err = exc_info.value
+        assert err.kind == KIND_INCOMPLETE
+        assert err.bytes_received == len(data)
+        assert err.frame_counts == {"reasoningContentEvent": 5, "contextUsageEvent": 1}
+        assert err.produced_text is False and err.produced_tool_use is False
+
+    @pytest.mark.asyncio
+    async def test_only_reasoning_no_context_usage_raises(self, aws_frames):
+        """
+        What it does: Only reasoning frames (17:15:07 shape), non-streaming.
+        Purpose: Raises as well.
+        """
+        data = incomplete_bytes(aws_frames, with_context_usage=False)
+
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await collect_stream_to_result(_stream_response(aws_frames.split(data, [7])), first_token_timeout=5)
+
+        assert exc_info.value.kind == KIND_INCOMPLETE
+
+    @pytest.mark.asyncio
+    async def test_metering_returns_result_with_thinking_only(self, aws_frames):
+        """
+        What it does: Reasoning + contextUsageEvent + meteringEvent, no body.
+        Purpose: Complete: returns the thinking-only result unchanged.
+        """
+        data = incomplete_bytes(aws_frames) + aws_frames.metering(0.2)
+
+        result = await collect_stream_to_result(_stream_response([data]), first_token_timeout=5)
+
+        assert THOUGHT_SECRET in result.thinking_content
+        assert result.content == ""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_body_without_metering_passes_with_warning(self, aws_frames, loguru_messages):
+        """
+        What it does: Reasoning + text, no metering.
+        Purpose: Result returned unchanged; one WARNING; no exception.
+        """
+        data = aws_frames.reasoning("r") + aws_frames.content(BODY_SECRET) + aws_frames.context_usage(1.0)
+
+        result = await collect_stream_to_result(_stream_response([data]), first_token_timeout=5)
+
+        assert result.content == BODY_SECRET
+        lines = [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+        assert len(lines) == 1 and BODY_SECRET not in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_tool_use_without_metering_passes(self, aws_frames):
+        """
+        What it does: Reasoning + tool call, no metering.
+        Purpose: Result with the tool call is returned.
+        """
+        data = (
+            aws_frames.reasoning("r")
+            + aws_frames.tool_start("Bash", "toolu_1")
+            + aws_frames.tool_input('{"command": "ls"}', "Bash", "toolu_1")
+            + aws_frames.tool_stop("Bash", "toolu_1")
+        )
+
+        result = await collect_stream_to_result(_stream_response([data]), first_token_timeout=5)
+
+        assert len(result.tool_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_switch_off_restores_old_result(self, aws_frames):
+        """
+        What it does: INCOMPLETE_RESPONSE_AS_ERROR=False with an incomplete stream.
+        Purpose: Old behavior: the thinking-only result is returned, no exception.
+        """
+        with patch("kiro.streaming_core.INCOMPLETE_RESPONSE_AS_ERROR", False):
+            result = await collect_stream_to_result(
+                _stream_response([incomplete_bytes(aws_frames)]), first_token_timeout=5
+            )
+
+        assert THOUGHT_SECRET in result.thinking_content
+        assert result.content == ""
+
+    @pytest.mark.asyncio
+    async def test_empty_response_keeps_kind_empty(self, aws_frames):
+        """
+        What it does: A lone contextUsageEvent (the earlier empty-response criterion).
+        Purpose: Still raised by the guard with kind "empty".
+        """
+        with pytest.raises(EmptyUpstreamResponseError) as exc_info:
+            await collect_stream_to_result(_stream_response([aws_frames.context_usage(1.0)]), first_token_timeout=5)
+
+        assert exc_info.value.kind == "empty"
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_exception_is_not_reported_as_incomplete(self, aws_frames):
+        """
+        What it does: Reasoning frames, then the upstream connection breaks.
+        Purpose: The original httpx error propagates (different failure class).
+        """
+        response = _stream_response([aws_frames.reasoning("r"), httpx.RemoteProtocolError("cut")])
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            await collect_stream_to_result(response, first_token_timeout=5)
+
+
+# ==================================================================================================
+# Peek-phase cancellation cleanup
+# ==================================================================================================
+
+class TestCancellationCleanup:
+    """The upstream response is closed when the task is cancelled while waiting for bytes."""
+
+    @staticmethod
+    def _blocking_response(first_chunk=None):
+        """Response whose stream yields first_chunk (optional) and then blocks forever."""
+        response = AsyncMock()
+        response.status_code = 200
+        response.aclose = AsyncMock()
+        started = asyncio.Event()
+
+        async def gen():
+            if first_chunk is not None:
+                yield first_chunk
+            started.set()
+            await asyncio.sleep(3600)
+            yield b""
+
+        response.aiter_bytes = lambda *a, **k: gen()
+        response.started = started
+        return response
+
+    @pytest.mark.asyncio
+    async def test_guard_closes_response_when_cancelled_waiting_for_first_chunk(self):
+        """
+        What it does: Cancels guard_upstream_response while it waits for the first chunk.
+        Purpose: response.aclose is awaited and CancelledError propagates.
+        """
+        response = self._blocking_response()
+        task = asyncio.ensure_future(guard_upstream_response(response, first_token_timeout=30, enabled=True))
+        await asyncio.sleep(0.01)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        response.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_closes_response_when_cancelled_while_peeking_further(self, aws_frames):
+        """
+        What it does: Cancels the guard after a neutral first chunk, while it waits for more.
+        Purpose: Same cleanup in the later-chunk loop.
+        """
+        response = self._blocking_response(first_chunk=aws_frames.context_usage(1.0))
+        task = asyncio.ensure_future(guard_upstream_response(response, first_token_timeout=30, enabled=True))
+        await asyncio.wait_for(response.started.wait(), timeout=2)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        response.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retry_loop_closes_response_when_cancelled(self):
+        """
+        What it does: Cancels stream_with_first_token_retry while the guard waits.
+        Purpose: The open response is closed and the cancellation propagates.
+        """
+        response = self._blocking_response()
+
+        async def make_request():
+            return response
+
+        async def processor(resp):
+            yield "never"
+
+        async def consume():
+            async for _ in stream_with_first_token_retry(
+                make_request, processor, first_token_timeout=30, empty_response_as_error=True
+            ):
+                pass
+
+        task = asyncio.ensure_future(consume())
+        await asyncio.sleep(0.01)
+
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.aclose.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_aclose_shielded_swallows_expected_close_errors(self):
+        """
+        What it does: The close coroutine raises httpx.HTTPError / RuntimeError / OSError.
+        Purpose: Expected close errors are swallowed (logged at DEBUG).
+        """
+        for error in (httpx.ReadError("x"), RuntimeError("x"), OSError("x")):
+            close = AsyncMock(side_effect=error)
+            await aclose_shielded(close)
+            close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aclose_shielded_does_not_swallow_other_errors(self):
+        """
+        What it does: The close coroutine raises a ValueError.
+        Purpose: Unexpected errors are not hidden.
+        """
+        with pytest.raises(ValueError):
+            await aclose_shielded(AsyncMock(side_effect=ValueError("bug")))
+
+    @pytest.mark.asyncio
+    async def test_aclose_shielded_finishes_close_even_if_caller_is_cancelled(self):
+        """
+        What it does: Cancels the caller while the close coroutine is still running.
+        Purpose: The shielded close runs to completion anyway.
+        """
+        finished = asyncio.Event()
+
+        async def slow_close():
+            await asyncio.sleep(0.05)
+            finished.set()
+
+        task = asyncio.ensure_future(aclose_shielded(slow_close))
+        await asyncio.sleep(0.01)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(finished.wait(), timeout=2)

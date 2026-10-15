@@ -33,7 +33,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from kiro.cache import ModelInfoCache
 from kiro.config import HIDDEN_MODELS
+from kiro.model_request_fields import resolve_additional_model_request_fields, summarize_fields
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
@@ -393,7 +395,8 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
 def build_kiro_payload(
     request_data: ChatCompletionRequest,
     conversation_id: str,
-    profile_arn: str
+    profile_arn: str,
+    model_cache: Optional[ModelInfoCache] = None
 ) -> dict:
     """
     Builds complete payload for Kiro API from OpenAI request.
@@ -405,6 +408,8 @@ def build_kiro_payload(
         request_data: Request in OpenAI format
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_cache: Model cache of the selected account, used to look up the target model's
+            additionalModelRequestFieldsSchema. None disables reasoning_effort forwarding.
     
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -425,11 +430,18 @@ def build_kiro_payload(
     # Extract thinking configuration from reasoning_effort
     thinking_config = extract_thinking_config_from_openai(request_data)
     
+    # Translate reasoning_effort into the model's additionalModelRequestFields (schema driven).
+    # OpenAI has no thinking object, so only the effort hint is passed.
+    additional_fields = resolve_additional_model_request_fields(
+        model_id, model_cache, None, request_data.reasoning_effort
+    )
+    
     logger.debug(
         f"Converting OpenAI request: model={request_data.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"additional_fields={summarize_fields(additional_fields)}"
     )
     
     # Use core function to build payload
@@ -440,7 +452,8 @@ def build_kiro_payload(
         tools=unified_tools,
         conversation_id=conversation_id,
         profile_arn=profile_arn,
-        thinking_config=thinking_config
+        thinking_config=thinking_config,
+        additional_model_request_fields=additional_fields
     )
     
     return result.payload

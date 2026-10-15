@@ -25,8 +25,10 @@ Contains classes and functions for:
 - Extracting JSON events
 - Processing tool calls
 - Content deduplication
+- Native reasoning frames (reasoningContentEvent) surfaced as "reasoning" events
 """
 
+import codecs
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -222,6 +224,9 @@ class AwsEventStreamParser:
     - tool_stop: End of tool call
     - usage: Credit consumption information
     - context_usage: Context usage percentage
+    - reasoning: Native reasoning text chunk (reasoningContentEvent {"text": ...})
+    - reasoning_signature: Native reasoning signature frame; "data" is the signature
+      length only (the signature itself is never forwarded)
     
     Attributes:
         buffer: Buffer for accumulating data
@@ -246,11 +251,21 @@ class AwsEventStreamParser:
         ('{"followupPrompt":', 'followup'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
+        # Native reasoning frames (reasoningContentEvent). A bare `{"text":` never occurs
+        # inside an escaped `{"content":"..."}` payload, so it cannot collide with content.
+        ('{"text":', 'reasoning'),
+        ('{"signature":', 'reasoning_signature'),
     ]
+    
+    # Event types whose raw JSON must never be written to logs (contains model reasoning)
+    REASONING_EVENT_TYPES = frozenset({'reasoning', 'reasoning_signature'})
     
     def __init__(self):
         """Initializes the parser."""
         self.buffer = ""
+        # Incremental decoder: a multi-byte UTF-8 character split across two network
+        # chunks must not be dropped (very common for CJK reasoning text).
+        self._decoder = codecs.getincrementaldecoder('utf-8')(errors='ignore')
         self.last_content: Optional[str] = None  # For deduplicating repeating content
         self.current_tool_call: Optional[Dict[str, Any]] = None
         self.tool_calls: List[Dict[str, Any]] = []
@@ -266,7 +281,7 @@ class AwsEventStreamParser:
             List of events in {"type": str, "data": Any} format
         """
         try:
-            self.buffer += chunk.decode('utf-8', errors='ignore')
+            self.buffer += self._decoder.decode(chunk)
         except Exception:
             return []
         
@@ -301,7 +316,13 @@ class AwsEventStreamParser:
                 if event:
                     events.append(event)
             except json.JSONDecodeError:
-                logger.warning(f"Failed to parse JSON: {json_str[:100]}")
+                if earliest_type in self.REASONING_EVENT_TYPES:
+                    # Never log reasoning text - only its length
+                    logger.warning(
+                        f"Failed to parse {earliest_type} JSON (length={len(json_str)})"
+                    )
+                else:
+                    logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
         return events
     
@@ -328,8 +349,52 @@ class AwsEventStreamParser:
             return {"type": "usage", "data": data.get('usage', 0)}
         elif event_type == 'context_usage':
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
+        elif event_type == 'reasoning':
+            return self._process_reasoning_event(data)
+        elif event_type == 'reasoning_signature':
+            return self._process_reasoning_signature_event(data)
         
         return None
+    
+    def _process_reasoning_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes a native reasoning text frame.
+        
+        Reasoning text is deliberately NOT deduplicated (repeated tokens are legitimate
+        text) and never touches `last_content`, so content deduplication and tool call
+        assembly are unaffected.
+        
+        Args:
+            data: Parsed JSON of the form {"text": "..."}
+        
+        Returns:
+            {"type": "reasoning", "data": text} or None for empty / non-string text
+        """
+        text = data.get('text')
+        if not isinstance(text, str):
+            logger.debug(
+                f"Ignoring reasoning event with non-string text (type={type(text).__name__})"
+            )
+            return None
+        if not text:
+            return None
+        return {"type": "reasoning", "data": text}
+    
+    def _process_reasoning_signature_event(self, data: dict) -> Dict[str, Any]:
+        """
+        Processes a native reasoning signature frame.
+        
+        Only the signature length is reported; the signature itself is not forwarded.
+        
+        Args:
+            data: Parsed JSON of the form {"signature": "<base64>"}
+        
+        Returns:
+            {"type": "reasoning_signature", "data": signature_length}
+        """
+        signature = data.get('signature')
+        length = len(signature) if isinstance(signature, str) else 0
+        return {"type": "reasoning_signature", "data": length}
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""
@@ -564,6 +629,7 @@ class AwsEventStreamParser:
     def reset(self) -> None:
         """Resets parser state."""
         self.buffer = ""
+        self._decoder.reset()
         self.last_content = None
         self.current_tool_call = None
         self.tool_calls = []

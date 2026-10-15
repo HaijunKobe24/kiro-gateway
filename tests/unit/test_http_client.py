@@ -1281,3 +1281,280 @@ class TestKiroHttpClientRequestParameters:
         assert captured_kwargs["params"]["filter"] == "active"
         assert json.loads(captured_kwargs["content"])["data"] == "value"
         assert response.status_code == 200
+
+class _RecordingClient:
+    """Fake httpx client: replays scripted responses and records every JSON body it was asked to send."""
+
+    is_closed = False
+
+    def __init__(self, script):
+        """Stores the scripted outcomes (response mocks or exceptions)."""
+        self.script = list(script)
+        self.sent_bodies = []
+
+    def build_request(self, method, url, **kwargs):
+        """Returns the kwargs so that send() can read the body."""
+        return kwargs
+
+    async def send(self, request, stream=False):
+        """Streaming send."""
+        return self._next(request)
+
+    async def request(self, method, url, **kwargs):
+        """Non-streaming request."""
+        return self._next(kwargs)
+
+    def _next(self, kwargs):
+        """Records the body and returns / raises the next scripted outcome."""
+        self.sent_bodies.append(json.loads(kwargs["content"]))
+        outcome = self.script.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _fake_response(status, body=b"{}"):
+    """Creates a response mock with an async aread()/aclose()."""
+    response = AsyncMock()
+    response.status_code = status
+    response.aread = AsyncMock(return_value=body)
+    response.aclose = AsyncMock()
+    return response
+
+
+REJECTION_BODY = json.dumps({
+    "message": "Improperly formed request: additionalModelRequestFields is invalid",
+    "reason": "REQUEST_BODY_INVALID",
+}).encode()
+
+
+class TestKiroHttpClientAdditionalFieldsFallback:
+    """Tests for the HTTP 400 fallback that retries once without additionalModelRequestFields."""
+
+    @staticmethod
+    def _payload():
+        """Returns a fresh payload carrying the field."""
+        return {
+            "conversationState": {"conversationId": "c"},
+            "additionalModelRequestFields": {"output_config": {"effort": "medium"}},
+        }
+
+    async def _run(self, manager, script, payload=None, stream=True):
+        """Runs request_with_retry against a scripted client, returns (response, client, payload)."""
+        http_client = KiroHttpClient(manager)
+        fake = _RecordingClient(script)
+        payload = self._payload() if payload is None else payload
+        with patch.object(http_client, "_get_client", return_value=fake):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                with patch("kiro.http_client.asyncio.sleep", new=AsyncMock()):
+                    response = await http_client.request_with_retry(
+                        "POST", "https://api.example.com/x", payload, stream=stream
+                    )
+        return response, fake, payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, False])
+    async def test_rejection_triggers_exactly_one_retry_without_the_field(
+        self, mock_auth_manager_for_http, loguru_messages, stream
+    ):
+        """
+        What it does: 400 naming the field, then 200.
+        Purpose: Exactly two sends; the second body lacks the field; the caller's dict is stripped in place.
+        """
+        ok = _fake_response(200)
+        response, fake, payload = await self._run(
+            mock_auth_manager_for_http, [_fake_response(400, REJECTION_BODY), ok], stream=stream
+        )
+
+        assert response is ok
+        assert len(fake.sent_bodies) == 2
+        assert "additionalModelRequestFields" in fake.sent_bodies[0]
+        assert "additionalModelRequestFields" not in fake.sent_bodies[1]
+        assert "additionalModelRequestFields" not in payload
+        warnings = [m for m in loguru_messages if m.startswith("WARNING|") and "additionalModelRequestFields" in m]
+        assert len(warnings) == 1 and "REQUEST_BODY_INVALID" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_first_rejected_response_is_closed(self, mock_auth_manager_for_http):
+        """
+        What it does: Inspects the consumed 400 response.
+        Purpose: The connection of the rejected response is released.
+        """
+        rejected = _fake_response(400, REJECTION_BODY)
+        await self._run(mock_auth_manager_for_http, [rejected, _fake_response(200)])
+
+        rejected.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        b'{"message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}',
+        b'{"message":"bad additionalModelRequestFields value","reason":"OTHER"}',
+        b"plain text mentioning additionalModelRequestFields",
+        b"REQUEST_BODY_INVALID",
+    ])
+    async def test_each_marker_form_is_recognized(self, mock_auth_manager_for_http, body):
+        """
+        What it does: reason only, message only, non-JSON text with either marker.
+        Purpose: All trigger the single retry.
+        """
+        _, fake, _ = await self._run(mock_auth_manager_for_http, [_fake_response(400, body), _fake_response(200)])
+
+        assert len(fake.sent_bodies) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", [
+        b'{"message":"Improperly formed request."}',
+        b'{"message":"Input is too long","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}',
+        b"not json at all",
+        b"",
+        b"\xff\xfe",
+    ])
+    async def test_unrelated_400_is_returned_untouched(self, mock_auth_manager_for_http, body):
+        """
+        What it does: 400s that do not mention the field (including a bare "Improperly formed request").
+        Purpose: One send only, payload intact, response readable again by the caller.
+        """
+        rejected = _fake_response(400, body)
+        response, fake, payload = await self._run(mock_auth_manager_for_http, [rejected])
+
+        assert response is rejected
+        assert len(fake.sent_bodies) == 1
+        assert "additionalModelRequestFields" in payload
+        rejected.aclose.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_request_without_the_field_never_reads_the_body(self, mock_auth_manager_for_http):
+        """
+        What it does: 400 with a marker body, but the request carried no field.
+        Purpose: Not our business: no read, no retry.
+        """
+        rejected = _fake_response(400, REJECTION_BODY)
+        response, fake, _ = await self._run(
+            mock_auth_manager_for_http, [rejected], payload={"conversationState": {}}
+        )
+
+        assert response is rejected
+        assert len(fake.sent_bodies) == 1
+        rejected.aread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_request_without_json_body_is_untouched(self, mock_auth_manager_for_http):
+        """
+        What it does: A GET (ListAvailableModels style, json_data=None) that returns 400.
+        Purpose: The fallback must not interfere with non-payload requests.
+        """
+        http_client = KiroHttpClient(mock_auth_manager_for_http)
+        rejected = _fake_response(400, REJECTION_BODY)
+        client = AsyncMock()
+        client.is_closed = False
+        client.request = AsyncMock(return_value=rejected)
+        with patch.object(http_client, "_get_client", return_value=client):
+            with patch("kiro.http_client.get_kiro_headers", return_value={}):
+                response = await http_client.request_with_retry("GET", "https://x", None, {"a": "b"})
+
+        assert response is rejected
+        client.request.assert_called_once()
+        rejected.aread.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_second_400_is_returned_after_only_one_retry(self, mock_auth_manager_for_http):
+        """
+        What it does: Both attempts return a marker 400.
+        Purpose: Exactly two sends (never three) and the second 400 is handed to the caller.
+        """
+        second = _fake_response(400, REJECTION_BODY)
+        response, fake, _ = await self._run(
+            mock_auth_manager_for_http, [_fake_response(400, REJECTION_BODY), second]
+        )
+
+        assert response is second
+        assert len(fake.sent_bodies) == 2
+
+    @pytest.mark.asyncio
+    async def test_403_refresh_still_works_before_and_after_the_fallback(self, mock_auth_manager_for_http):
+        """
+        What it does: 403 -> 400(marker) -> 403 -> 200.
+        Purpose: Token refresh retries are untouched by the fallback; the final response is 200.
+        """
+        ok = _fake_response(200)
+        response, fake, _ = await self._run(
+            mock_auth_manager_for_http,
+            [_fake_response(403), _fake_response(400, REJECTION_BODY), _fake_response(403), ok],
+        )
+
+        assert response is ok
+        assert mock_auth_manager_for_http.force_refresh.await_count == 2
+        assert len(fake.sent_bodies) == 4
+        assert "additionalModelRequestFields" not in fake.sent_bodies[3]
+
+    @pytest.mark.asyncio
+    async def test_5xx_backoff_still_works_after_the_fallback(self, mock_auth_manager_for_http):
+        """
+        What it does: 400(marker) -> 503 -> 200.
+        Purpose: The retry after the fallback goes through the normal backoff path.
+        """
+        ok = _fake_response(200)
+        response, fake, _ = await self._run(
+            mock_auth_manager_for_http, [_fake_response(400, REJECTION_BODY), _fake_response(503), ok]
+        )
+
+        assert response is ok
+        assert len(fake.sent_bodies) == 3
+
+    @pytest.mark.asyncio
+    async def test_exhausted_5xx_does_not_trigger_the_fallback(self, mock_auth_manager_for_http):
+        """
+        What it does: 5xx on every attempt (even with a marker body).
+        Purpose: The fallback only looks at a final 400; the 5xx is returned for classification.
+        """
+        script = [_fake_response(503, REJECTION_BODY) for _ in range(FIRST_TOKEN_MAX_RETRIES)]
+        response, fake, payload = await self._run(mock_auth_manager_for_http, script)
+
+        assert response.status_code == 503
+        assert len(fake.sent_bodies) == FIRST_TOKEN_MAX_RETRIES
+        assert "additionalModelRequestFields" in payload
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_the_retry_is_not_swallowed(self, mock_auth_manager_for_http):
+        """
+        What it does: 400(marker) then timeouts on every following attempt.
+        Purpose: The usual 504 HTTPException surfaces.
+        """
+        script = [_fake_response(400, REJECTION_BODY)] + [
+            httpx.ReadTimeout("slow") for _ in range(FIRST_TOKEN_MAX_RETRIES)
+        ]
+        with pytest.raises(HTTPException) as exc_info:
+            await self._run(mock_auth_manager_for_http, script)
+
+        assert exc_info.value.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_reused_payload_stays_stripped_for_later_requests(self, mock_auth_manager_for_http):
+        """
+        What it does: Sends the same dict twice (the first-token retry pattern).
+        Purpose: The second call does not re-send the rejected field, so no second 400 round trip.
+        """
+        payload = self._payload()
+        await self._run(mock_auth_manager_for_http, [_fake_response(400, REJECTION_BODY), _fake_response(200)], payload)
+        _, fake, _ = await self._run(mock_auth_manager_for_http, [_fake_response(200)], payload)
+
+        assert fake.sent_bodies == [{"conversationState": {"conversationId": "c"}}]
+
+    @pytest.mark.asyncio
+    async def test_log_contains_only_truncated_error_message(self, mock_auth_manager_for_http, loguru_messages):
+        """
+        What it does: A rejection with a very long message and a non-JSON rejection.
+        Purpose: Only reason/message (truncated to 200 chars) or a length are logged, never the request.
+        """
+        long_body = json.dumps({"message": "additionalModelRequestFields " + "m" * 5000, "reason": "R"}).encode()
+        await self._run(mock_auth_manager_for_http, [_fake_response(400, long_body), _fake_response(200)])
+        await self._run(
+            mock_auth_manager_for_http,
+            [_fake_response(400, b"REQUEST_BODY_INVALID plain"), _fake_response(200)],
+        )
+
+        warnings = [m for m in loguru_messages if m.startswith("WARNING|") and "retrying once" in m]
+        assert len(warnings) == 2
+        assert "m" * 300 not in warnings[0]
+        assert "non-JSON body" in warnings[1]
+        assert not [m for m in loguru_messages if "conversationId" in m or "effort" in m]

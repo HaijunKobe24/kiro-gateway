@@ -1998,3 +1998,1060 @@ class TestChatCompletionsLegacyMode:
         
         assert failover_enabled is False
         print("✅ Legacy mode correctly skips failover loop")
+
+# ==================================================================================================
+# Native reasoning (reasoningContentEvent) - all four route paths
+# ==================================================================================================
+
+class TestNativeReasoningRouteCoverage:
+    """
+    Proves that native Kiro reasoning reaches the client through ALL FOUR /v1/chat/completions
+    paths: account-system branch and legacy branch, each streaming and non-streaming.
+
+    Both branches delegate to stream_with_first_token_retry / collect_stream_response, so a
+    parser / streaming-layer fix benefits them equally; these tests drive the real routes
+    (real parser, real formatters, mocked HTTP) to show it explicitly.
+    """
+
+    TEXTS = ["I", "'ll", " look", ".\n\n", "中文推理", " 😀"]
+
+    @staticmethod
+    def _install_account_manager(app_state, monkeypatch, account_system):
+        """Installs a deterministic account manager and selects the branch under test."""
+        from kiro.account_manager import Account, AccountStats
+
+        auth_manager = MagicMock()
+        auth_manager.api_host = "https://kiro.example.invalid"
+        auth_manager.profile_arn = "arn:aws:codewhisperer:us-east-1:000000000000:profile/TEST"
+        model_cache = MagicMock()
+        model_cache.get_max_input_tokens.return_value = 200000
+        account = Account(
+            id="acc1",
+            auth_manager=auth_manager,
+            model_cache=model_cache,
+            model_resolver=MagicMock(),
+            stats=AccountStats(),
+        )
+        manager = MagicMock()
+        manager._accounts = {"acc1": account}
+        manager.get_first_account = MagicMock(return_value=account)
+        manager.get_next_account = AsyncMock(return_value=account)
+        manager.report_success = AsyncMock()
+        manager.report_failure = AsyncMock()
+        monkeypatch.setattr(app_state, "account_manager", manager)
+        monkeypatch.setattr(app_state, "account_system", account_system)
+        return manager
+
+    def _frames(self, aws_frames, with_tool=False):
+        data = b"".join(aws_frames.reasoning(t) for t in self.TEXTS)
+        data += aws_frames.signature("QUJD" * 10) + aws_frames.content("Hello")
+        if with_tool:
+            data += (
+                aws_frames.tool_start("Bash", "toolu_1")
+                + aws_frames.tool_input('{"command": "ls"}', "Bash", "toolu_1")
+                + aws_frames.tool_stop("Bash", "toolu_1")
+            )
+        return data + aws_frames.context_usage(1.0)
+
+    def _post(self, test_client, valid_proxy_api_key, mock_httpx_response, chunks, stream):
+        with patch("kiro.routes_openai.KiroHttpClient") as client_class, \
+                patch("kiro.streaming_core.FAKE_REASONING_ENABLED", True), \
+                patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"), \
+                patch("kiro.streaming_openai.FAKE_REASONING_HANDLING", "as_reasoning_content"):
+            instance = AsyncMock()
+            instance.request_with_retry = AsyncMock(
+                return_value=mock_httpx_response(status_code=200, stream_chunks=chunks)
+            )
+            instance.close = AsyncMock()
+            client_class.return_value = instance
+            return test_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": stream,
+                },
+            )
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_streaming_surfaces_every_reasoning_frame(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: POST stream=true through the account-system / legacy branch.
+        Goal: One reasoning_content delta per frame (first with role), then content, then [DONE].
+        """
+        manager = self._install_account_manager(test_client.app.state, monkeypatch, account_system)
+
+        response = self._post(
+            test_client, valid_proxy_api_key, mock_httpx_response,
+            aws_frames.split(self._frames(aws_frames), [9, 40, 3]), stream=True,
+        )
+
+        assert response.status_code == 200
+        payloads = [line[len("data: "):] for line in response.text.split("\n\n") if line.startswith("data: ")]
+        assert payloads[-1] == "[DONE]"
+        chunks = [json.loads(p) for p in payloads[:-1]]
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        assert [d["reasoning_content"] for d in deltas if "reasoning_content" in d] == self.TEXTS
+        assert deltas[0].get("role") == "assistant" and "reasoning_content" in deltas[0]
+        assert "".join(d["content"] for d in deltas if "content" in d) == "Hello"
+        if account_system:
+            manager.get_next_account.assert_awaited()
+            manager.report_success.assert_awaited()
+        else:
+            manager.get_next_account.assert_not_awaited()
+            manager.get_first_account.assert_called()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_non_streaming_returns_reasoning_content(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: POST stream=false through both branches.
+        Goal: message.reasoning_content carries all reasoning text; tool_calls preserved.
+        """
+        manager = self._install_account_manager(test_client.app.state, monkeypatch, account_system)
+
+        response = self._post(
+            test_client, valid_proxy_api_key, mock_httpx_response,
+            [self._frames(aws_frames, with_tool=True)], stream=False,
+        )
+
+        assert response.status_code == 200
+        choice = response.json()["choices"][0]
+        assert choice["message"]["reasoning_content"] == "".join(self.TEXTS)
+        assert choice["message"]["content"] == "Hello"
+        assert choice["message"]["tool_calls"][0]["function"]["name"] == "Bash"
+        assert choice["finish_reason"] == "tool_calls"
+        if account_system:
+            manager.get_next_account.assert_awaited()
+        else:
+            manager.get_next_account.assert_not_awaited()
+
+
+import asyncio
+
+import httpx
+
+
+# ==================================================================================================
+# Empty upstream response - all four route paths
+# ==================================================================================================
+
+class TestEmptyUpstreamResponse:
+    """
+    Kiro answers HTTP 200 with a stream that only carries a contextUsageEvent frame.
+    /v1/chat/completions must turn that into an explicit, retryable HTTP error on ALL FOUR
+    paths (account-system / legacy x streaming / non-streaming), without gateway-side retry
+    and without touching the account's health.
+    """
+
+    @staticmethod
+    def _hanging_response():
+        """Response whose stream never produces a byte (first token timeout)."""
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 200
+        response.aclose = AsyncMock()
+
+        async def gen():
+            await asyncio.sleep(3600)
+            yield b""
+
+        response.aiter_bytes = lambda *a, **k: gen()
+        return response
+
+    @staticmethod
+    def _post(test_client, key, responses, stream, fast_timeout=False):
+        """POSTs /v1/chat/completions; request_with_retry returns `responses` in order."""
+        from kiro.streaming_openai import stream_with_first_token_retry as real_retry
+
+        def fast(**kwargs):
+            kwargs["first_token_timeout"] = 0.05
+            return real_retry(**kwargs)
+
+        def do_post():
+            return test_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": stream,
+                },
+            )
+
+        with patch("kiro.routes_openai.KiroHttpClient") as client_class:
+            instance = AsyncMock()
+            instance.request_with_retry = AsyncMock(side_effect=list(responses))
+            instance.close = AsyncMock()
+            client_class.return_value = instance
+            if fast_timeout:
+                with patch("kiro.routes_openai.stream_with_first_token_retry", side_effect=fast):
+                    return do_post(), instance
+            return do_post(), instance
+
+    @staticmethod
+    def _install(test_client, monkeypatch, account_system):
+        return TestNativeReasoningRouteCoverage._install_account_manager(
+            test_client.app.state, monkeypatch, account_system
+        )
+
+    @staticmethod
+    def _sse_payloads(text):
+        """Decoded `data:` payloads of an OpenAI SSE body."""
+        return [line[len("data: "):] for line in text.split("\n\n") if line.startswith("data: ")]
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_empty_response_becomes_503_error(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, stream
+    ):
+        """
+        What it does: Upstream sends one contextUsageEvent frame (the real 147 byte shape).
+        Goal: HTTP 503 with an OpenAI error body and x-should-retry, no SSE content,
+        and the upstream connection is closed.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        chunks = [aws_frames.context_usage(60.73619842529297)]
+
+        response, http_client = self._post(
+            test_client, valid_proxy_api_key, [mock_httpx_response(status_code=200, stream_chunks=chunks)], stream
+        )
+
+        print(response.status_code, response.text)
+        assert response.status_code == 503
+        assert response.json() == {
+            "error": {
+                "message": response.json()["error"]["message"],
+                "type": "server_error",
+                "param": None,
+                "code": "upstream_empty_response",
+            }
+        }
+        assert "empty response" in response.json()["error"]["message"]
+        assert response.headers["x-should-retry"] == "true"
+        assert response.headers["content-type"].startswith("application/json")
+        assert "chat.completion.chunk" not in response.text
+        assert "[DONE]" not in response.text
+        http_client.close.assert_awaited()
+        assert http_client.request_with_retry.await_count == 1
+        if account_system:
+            manager.get_next_account.assert_awaited_once()
+        else:
+            manager.get_next_account.assert_not_awaited()
+            manager.get_first_account.assert_called()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_empty_response_split_into_single_bytes(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, stream
+    ):
+        """
+        What it does: The empty-response frame arrives one byte per chunk.
+        Goal: Same 503: detection does not depend on network chunking.
+        """
+        self._install(test_client, monkeypatch, True)
+        chunks = aws_frames.split(aws_frames.context_usage(60.7), [1])
+
+        response, _ = self._post(
+            test_client, valid_proxy_api_key, [mock_httpx_response(status_code=200, stream_chunks=chunks)], stream
+        )
+
+        assert response.status_code == 503
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_account_health_is_untouched_by_empty_response(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, stream
+    ):
+        """
+        What it does: Account system, empty upstream response.
+        Goal: Neither report_failure (circuit breaker) nor report_success is awaited and
+        no other account is tried: an empty response is not an account problem.
+        """
+        manager = self._install(test_client, monkeypatch, True)
+
+        response, _ = self._post(
+            test_client, valid_proxy_api_key,
+            [mock_httpx_response(status_code=200, stream_chunks=[aws_frames.context_usage(1.0)])], stream
+        )
+
+        assert response.status_code == 503
+        manager.report_failure.assert_not_awaited()
+        manager.report_success.assert_not_awaited()
+        assert manager.get_next_account.await_count == 1
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_metered_empty_answer_is_passed_through(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, stream
+    ):
+        """
+        What it does: contextUsageEvent + meteringEvent, no output (the model really said nothing).
+        Goal: HTTP 200 with an empty completion ([DONE] terminated when streaming), not an error.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        chunks = [aws_frames.context_usage(2.0) + aws_frames.metering(0.4)]
+
+        response, _ = self._post(
+            test_client, valid_proxy_api_key, [mock_httpx_response(status_code=200, stream_chunks=chunks)], stream
+        )
+
+        assert response.status_code == 200
+        if stream:
+            assert self._sse_payloads(response.text)[-1] == "[DONE]"
+        else:
+            assert response.json()["choices"][0]["message"]["content"] == ""
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_switch_off_passes_empty_response_through(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, stream
+    ):
+        """
+        What it does: EMPTY_RESPONSE_AS_ERROR=False, upstream sends the empty-response frame.
+        Goal: Native behavior: HTTP 200 with an empty completion.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            response, _ = self._post(
+                test_client, valid_proxy_api_key,
+                [mock_httpx_response(status_code=200, stream_chunks=[aws_frames.context_usage(1.0)])], stream
+            )
+
+        assert response.status_code == 200
+        if stream:
+            assert self._sse_payloads(response.text)[-1] == "[DONE]"
+        else:
+            assert response.json()["choices"][0]["message"]["content"] == ""
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_configured_status_is_used(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, stream
+    ):
+        """
+        What it does: EMPTY_RESPONSE_ERROR_STATUS=500.
+        Goal: Route answers 500 with the same server_error body.
+        """
+        self._install(test_client, monkeypatch, False)
+
+        with patch("kiro.empty_response.EMPTY_RESPONSE_ERROR_STATUS", 500):
+            response, _ = self._post(
+                test_client, valid_proxy_api_key,
+                [mock_httpx_response(status_code=200, stream_chunks=[aws_frames.context_usage(1.0)])], stream
+            )
+
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_warning_is_logged_once(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, loguru_messages,
+        monkeypatch, account_system
+    ):
+        """
+        What it does: Empty response, then reads the log.
+        Goal: One WARNING with model / mode / sizes, no message content.
+        """
+        self._install(test_client, monkeypatch, account_system)
+
+        response, _ = self._post(
+            test_client, valid_proxy_api_key,
+            [mock_httpx_response(status_code=200, stream_chunks=[aws_frames.context_usage(1.0)])], False
+        )
+
+        assert response.status_code == 503
+        lines = [m for m in loguru_messages if "[EmptyUpstreamResponse]" in m]
+        assert len(lines) == 1
+        assert lines[0].startswith("WARNING|")
+        assert "model=claude-sonnet-4-5" in lines[0]
+        assert "stream=False" in lines[0]
+        assert not any("Hello" in line for line in lines)
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_normal_response_marks_account_healthy_once(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: A normal streaming response through the new priming structure.
+        Goal: First chunk carries role=assistant, last item is [DONE]; report_success awaited
+        exactly once (account system) and report_failure never.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        data = aws_frames.content("Hello") + aws_frames.context_usage(2.0) + aws_frames.metering(0.4)
+
+        response, _ = self._post(
+            test_client, valid_proxy_api_key,
+            [mock_httpx_response(status_code=200, stream_chunks=aws_frames.split(data, [11]))], True
+        )
+
+        assert response.status_code == 200
+        payloads = self._sse_payloads(response.text)
+        assert payloads[-1] == "[DONE]"
+        first = json.loads(payloads[0])
+        assert first["choices"][0]["delta"]["role"] == "assistant"
+        assert "".join(
+            json.loads(p)["choices"][0]["delta"].get("content", "") for p in payloads[:-1]
+        ) == "Hello"
+        manager.report_failure.assert_not_awaited()
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_first_token_timeout_then_empty_response(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: The first upstream response never sends a byte; the retried one is empty.
+        Goal: The timeout is retried as before, the retried response is checked too: HTTP 503.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        responses = [
+            self._hanging_response(),
+            mock_httpx_response(status_code=200, stream_chunks=[aws_frames.context_usage(1.0)]),
+        ]
+
+        response, http_client = self._post(
+            test_client, valid_proxy_api_key, responses, True, fast_timeout=True
+        )
+
+        assert response.status_code == 503
+        assert http_client.request_with_retry.await_count == 2
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_first_token_timeout_then_normal_response(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: The first upstream response hangs, the retried one is normal.
+        Goal: HTTP 200 with the complete content and a single role chunk.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        data = aws_frames.content("Hi") + aws_frames.context_usage(2.0) + aws_frames.metering(0.4)
+        responses = [self._hanging_response(), mock_httpx_response(status_code=200, stream_chunks=[data])]
+
+        response, _ = self._post(test_client, valid_proxy_api_key, responses, True, fast_timeout=True)
+
+        assert response.status_code == 200
+        payloads = self._sse_payloads(response.text)
+        assert payloads[-1] == "[DONE]"
+        deltas = [json.loads(p)["choices"][0]["delta"] for p in payloads[:-1]]
+        assert sum(1 for d in deltas if d.get("role") == "assistant") == 1
+        assert "".join(d.get("content", "") for d in deltas) == "Hi"
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_upstream_http_error_is_unchanged(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, monkeypatch, stream
+    ):
+        """
+        What it does: Upstream answers HTTP 500 (legacy branch).
+        Goal: The existing error path is untouched: same status, kiro_api_error body.
+        """
+        self._install(test_client, monkeypatch, False)
+        upstream = mock_httpx_response(status_code=500, text="upstream exploded")
+
+        response, _ = self._post(test_client, valid_proxy_api_key, [upstream], stream)
+
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "kiro_api_error"
+
+
+# ==================================================================================================
+# Incomplete upstream response - all route paths
+# ==================================================================================================
+
+from contextlib import ExitStack  # noqa: E402
+
+INCOMPLETE_ROUTE_SECRET = "SECRET_ROUTE_THOUGHT_6a90"
+
+
+def _reasoning_pins() -> ExitStack:
+    """Pins the native reasoning handling so the tests do not depend on the local .env."""
+    stack = ExitStack()
+    stack.enter_context(patch("kiro.streaming_core.FAKE_REASONING_ENABLED", True))
+    stack.enter_context(patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"))
+    stack.enter_context(patch("kiro.streaming_openai.FAKE_REASONING_HANDLING", "as_reasoning_content"))
+    return stack
+
+
+class TestIncompleteUpstreamResponse:
+    """
+    Kiro ends the stream early while reasoning: reasoning frames only, no meteringEvent,
+    no text, no tool call. /v1/chat/completions must answer HTTP 503 (non-streaming) or end
+    the SSE stream with an error chunk and [DONE] (streaming) on ALL FOUR paths, without
+    touching the account.
+    """
+
+    @staticmethod
+    def _incomplete(aws_frames, with_context_usage=True):
+        data = b"".join(aws_frames.reasoning(f"{INCOMPLETE_ROUTE_SECRET} {i}") for i in range(5))
+        return data + (aws_frames.context_usage(3.0) if with_context_usage else b"")
+
+    @staticmethod
+    def _run(test_client, key, mock_httpx_response, chunks, stream):
+        with _reasoning_pins():
+            return TestEmptyUpstreamResponse._post(
+                test_client, key, [mock_httpx_response(status_code=200, stream_chunks=chunks)], stream
+            )
+
+    @staticmethod
+    def _install(test_client, monkeypatch, account_system):
+        return TestNativeReasoningRouteCoverage._install_account_manager(
+            test_client.app.state, monkeypatch, account_system
+        )
+
+    @staticmethod
+    def _payloads(text):
+        return TestEmptyUpstreamResponse._sse_payloads(text)
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_non_streaming_becomes_503_error(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: stream=false, upstream sends reasoning + contextUsageEvent only.
+        Goal: HTTP 503, OpenAI error body (server_error / upstream_incomplete_response),
+        x-should-retry, upstream closed, one upstream request, account untouched.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+
+        response, http_client = self._run(
+            test_client, valid_proxy_api_key, mock_httpx_response, [self._incomplete(aws_frames)], False
+        )
+
+        print(response.status_code, response.text)
+        assert response.status_code == 503
+        error = response.json()["error"]
+        assert error["type"] == "server_error" and error["code"] == "upstream_incomplete_response"
+        assert "incomplete" in error["message"] and "retry" in error["message"]
+        assert INCOMPLETE_ROUTE_SECRET not in response.text
+        assert response.headers["x-should-retry"] == "true"
+        http_client.close.assert_awaited()
+        assert http_client.request_with_retry.await_count == 1
+        manager.report_failure.assert_not_awaited()
+        manager.report_success.assert_not_awaited()
+        if account_system:
+            manager.get_next_account.assert_awaited_once()
+        else:
+            manager.get_next_account.assert_not_awaited()
+            manager.get_first_account.assert_called()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_streaming_ends_with_error_chunk_and_done(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: stream=true, upstream sends reasoning + contextUsageEvent only.
+        Goal: HTTP 200 SSE: reasoning deltas, {"error": ...}, [DONE]; no finish_reason chunk;
+        no STREAM_READY text; account not penalised; report_success once.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+
+        response, http_client = self._run(
+            test_client, valid_proxy_api_key, mock_httpx_response,
+            aws_frames.split(self._incomplete(aws_frames), [11, 50]), True,
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "STREAM_READY" not in response.text
+        payloads = self._payloads(response.text)
+        assert payloads[-1] == "[DONE]"
+        error = json.loads(payloads[-2])["error"]
+        assert error["type"] == "server_error" and error["code"] == "upstream_incomplete_response"
+        chunks = [json.loads(p) for p in payloads[:-2]]
+        assert len(chunks) == 5
+        assert all(c["choices"][0]["finish_reason"] is None for c in chunks)
+        assert all("reasoning_content" in c["choices"][0]["delta"] for c in chunks)
+        assert http_client.request_with_retry.await_count == 1
+        manager.report_failure.assert_not_awaited()
+        if account_system:
+            manager.get_next_account.assert_awaited_once()
+            manager.report_success.assert_awaited_once()
+        else:
+            manager.get_next_account.assert_not_awaited()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_only_reasoning_frames_without_context_usage(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system, stream
+    ):
+        """
+        What it does: Only reasoning frames (17:15:07 shape), 7-byte chunks.
+        Goal: Treated as incomplete on every path.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        data = self._incomplete(aws_frames, with_context_usage=False)
+
+        response, _ = self._run(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames.split(data, [7]), stream
+        )
+
+        if stream:
+            assert response.status_code == 200
+            assert "upstream_incomplete_response" in response.text
+            assert '"finish_reason": "stop"' not in response.text
+        else:
+            assert response.status_code == 503
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_metering_makes_it_a_normal_response(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system, stream
+    ):
+        """
+        What it does: Same reasoning + meteringEvent, no body.
+        Goal: HTTP 200 pass-through with finish_reason stop.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        data = self._incomplete(aws_frames) + aws_frames.metering(0.4)
+
+        response, _ = self._run(test_client, valid_proxy_api_key, mock_httpx_response, [data], stream)
+
+        assert response.status_code == 200
+        if stream:
+            payloads = self._payloads(response.text)
+            assert payloads[-1] == "[DONE]"
+            assert json.loads(payloads[-2])["choices"][0]["finish_reason"] == "stop"
+            assert "upstream_incomplete_response" not in response.text
+        else:
+            body = response.json()
+            assert body["choices"][0]["finish_reason"] == "stop"
+            assert INCOMPLETE_ROUTE_SECRET in body["choices"][0]["message"]["reasoning_content"]
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_text_without_metering_passes_through_with_warning(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, loguru_messages,
+        monkeypatch, account_system, stream
+    ):
+        """
+        What it does: Reasoning + text, no meteringEvent (possibly truncated text).
+        Goal: Unchanged HTTP 200; exactly one WARNING without content; no ERROR.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        data = aws_frames.reasoning("r") + aws_frames.content("partial answer") + aws_frames.context_usage(2.0)
+
+        response, _ = self._run(test_client, valid_proxy_api_key, mock_httpx_response, [data], stream)
+
+        assert response.status_code == 200
+        assert "partial answer" in response.text
+        lines = [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+        assert len(lines) == 1 and "partial answer" not in lines[0]
+        assert not [m for m in loguru_messages if m.startswith("ERROR|")]
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_tool_use_without_metering_passes_through(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, stream
+    ):
+        """
+        What it does: Reasoning + tool call, no meteringEvent.
+        Goal: HTTP 200 with finish_reason tool_calls.
+        """
+        self._install(test_client, monkeypatch, True)
+        data = (
+            aws_frames.reasoning("r")
+            + aws_frames.tool_start("Bash", "toolu_1")
+            + aws_frames.tool_input('{"command": "ls"}', "Bash", "toolu_1")
+            + aws_frames.tool_stop("Bash", "toolu_1")
+            + aws_frames.context_usage(1.0)
+        )
+
+        response, _ = self._run(test_client, valid_proxy_api_key, mock_httpx_response, [data], stream)
+
+        assert response.status_code == 200
+        assert "tool_calls" in response.text
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_switch_off_restores_pass_through(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system, stream
+    ):
+        """
+        What it does: INCOMPLETE_RESPONSE_AS_ERROR=False with an incomplete stream.
+        Goal: Old behavior on every path: HTTP 200 with finish_reason stop.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+
+        with patch("kiro.streaming_core.INCOMPLETE_RESPONSE_AS_ERROR", False):
+            response, _ = self._run(
+                test_client, valid_proxy_api_key, mock_httpx_response, [self._incomplete(aws_frames)], stream
+            )
+
+        assert response.status_code == 200
+        assert "upstream_incomplete_response" not in response.text
+        assert '"finish_reason": "stop"' in response.text.replace('":"', '": "')
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("status", [500, 529])
+    def test_non_streaming_reuses_the_configured_status(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, status
+    ):
+        """
+        What it does: EMPTY_RESPONSE_ERROR_STATUS patched to 500 / 529.
+        Goal: The incomplete response uses that status; the body type stays server_error.
+        """
+        self._install(test_client, monkeypatch, False)
+
+        with patch("kiro.empty_response.EMPTY_RESPONSE_ERROR_STATUS", status):
+            response, _ = self._run(
+                test_client, valid_proxy_api_key, mock_httpx_response, [self._incomplete(aws_frames)], False
+            )
+
+        assert response.status_code == status
+        assert response.json()["error"]["type"] == "server_error"
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_exactly_one_warning_and_no_error_log(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, loguru_messages,
+        monkeypatch, account_system, stream
+    ):
+        """
+        What it does: Incomplete response, reads the log.
+        Goal: One [IncompleteUpstreamResponse] WARNING (status= / action=error_event), no
+        "Internal error" or "Error during streaming" ERROR, no reasoning text.
+        """
+        self._install(test_client, monkeypatch, account_system)
+
+        self._run(test_client, valid_proxy_api_key, mock_httpx_response, [self._incomplete(aws_frames)], stream)
+
+        lines = [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+        assert len(lines) == 1 and lines[0].startswith("WARNING|")
+        assert ("action=error_event" if stream else "status=503") in lines[0]
+        assert not any(INCOMPLETE_ROUTE_SECRET in m for m in loguru_messages)
+        assert not [
+            m for m in loguru_messages
+            if m.startswith("ERROR|") and ("Internal error" in m or "Error during streaming" in m)
+        ]
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_empty_response_regression(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, loguru_messages,
+        monkeypatch, stream
+    ):
+        """
+        What it does: A lone contextUsageEvent (the earlier empty-response criterion).
+        Goal: Still HTTP 503, code upstream_empty_response, [EmptyUpstreamResponse] label.
+        """
+        self._install(test_client, monkeypatch, False)
+
+        response, _ = self._run(
+            test_client, valid_proxy_api_key, mock_httpx_response, [aws_frames.context_usage(1.0)], stream
+        )
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "upstream_empty_response"
+        assert [m for m in loguru_messages if "[EmptyUpstreamResponse]" in m]
+        assert not [m for m in loguru_messages if "[IncompleteUpstreamResponse]" in m]
+
+    @pytest.mark.parametrize("stream", [True, False])
+    def test_empty_switch_off_does_not_turn_context_usage_into_incomplete(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, stream
+    ):
+        """
+        What it does: EMPTY_RESPONSE_AS_ERROR=False, INCOMPLETE on, a lone contextUsageEvent.
+        Goal: Passed through (NO_OUTPUT_FRAMES is not INCOMPLETE): HTTP 200.
+        """
+        self._install(test_client, monkeypatch, False)
+
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            response, _ = self._run(
+                test_client, valid_proxy_api_key, mock_httpx_response, [aws_frames.context_usage(1.0)], stream
+            )
+
+        assert response.status_code == 200
+        assert "upstream_incomplete_response" not in response.text
+
+
+# Exception types through which the TestClient reports a cancelled request handler
+CANCELLATION_SURFACES = {"CancelledError", "RuntimeError", "BaseExceptionGroup", "ExceptionGroup"}
+
+
+class TestCancellationClosesUpstream:
+    """
+    A client that goes away while the route waits for the upstream (peek phase of a stream,
+    or the aggregation of a non-streaming response) must not leak the upstream connection.
+    The cancellation is simulated by the awaited helper raising asyncio.CancelledError.
+    """
+
+    @pytest.mark.parametrize("target", ["prime_sse_stream", "collect_stream_response"])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_http_client_is_closed_on_cancellation(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, target
+    ):
+        """
+        What it does: Makes the awaited peek / collect helper raise CancelledError.
+        Goal: http_client.close() is awaited on both branches before the cancellation propagates;
+        the account is not penalised.
+        """
+        manager = TestNativeReasoningRouteCoverage._install_account_manager(
+            test_client.app.state, monkeypatch, account_system
+        )
+        stream = target == "prime_sse_stream"
+
+        with patch("kiro.routes_openai.KiroHttpClient") as client_class, \
+                patch(f"kiro.routes_openai.{target}", AsyncMock(side_effect=asyncio.CancelledError())):
+            instance = AsyncMock()
+            instance.request_with_retry = AsyncMock(
+                return_value=mock_httpx_response(status_code=200, stream_chunks=[aws_frames.reasoning("x")])
+            )
+            instance.close = AsyncMock()
+            client_class.return_value = instance
+            try:
+                test_client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {valid_proxy_api_key}"},
+                    json={"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "hi"}], "stream": stream},
+                )
+            except BaseException as surfaced:  # noqa: BLE001 - narrowed right below
+                # Starlette's BaseHTTPMiddleware reports a cancelled handler as an exception
+                # group wrapping "No response returned."; anything else is a real failure.
+                if type(surfaced).__name__ not in CANCELLATION_SURFACES:
+                    raise
+
+        instance.close.assert_awaited()
+        manager.report_failure.assert_not_awaited()
+
+
+
+# ==================================================================================================
+# additionalModelRequestFields (reasoning_effort passthrough) - all four route paths
+# ==================================================================================================
+
+class TestForwardModelRequestFieldsRoutes:
+    """
+    Proves that /v1/chat/completions writes the schema-translated reasoning_effort into the top
+    level of the Kiro payload on ALL FOUR paths (account-system / legacy x streaming / non-streaming),
+    and that the HTTP 400 fallback works end to end with the real KiroHttpClient.
+    """
+
+    REJECTION = json.dumps({
+        "message": "Improperly formed request: additionalModelRequestFields",
+        "reason": "REQUEST_BODY_INVALID",
+    }).encode()
+
+    @staticmethod
+    def _install_account_manager(app_state, monkeypatch, account_system, model_cache):
+        """Installs a deterministic account manager owning `model_cache` and selects the branch."""
+        from kiro.account_manager import Account, AccountStats
+
+        auth_manager = MagicMock()
+        auth_manager.api_host = "https://kiro.example.invalid"
+        auth_manager.profile_arn = "arn:aws:codewhisperer:us-east-1:000000000000:profile/TEST"
+        auth_manager.get_access_token = AsyncMock(return_value="token")
+        auth_manager.force_refresh = AsyncMock(return_value="token")
+        account = Account(
+            id="acc1", auth_manager=auth_manager, model_cache=model_cache,
+            model_resolver=MagicMock(), stats=AccountStats(),
+        )
+        manager = MagicMock()
+        manager._accounts = {"acc1": account}
+        manager.get_first_account = MagicMock(return_value=account)
+        manager.get_next_account = AsyncMock(return_value=account)
+        manager.report_success = AsyncMock()
+        manager.report_failure = AsyncMock()
+        monkeypatch.setattr(app_state, "account_manager", manager)
+        monkeypatch.setattr(app_state, "account_system", account_system)
+        return manager
+
+    @staticmethod
+    def _ok_frames(aws_frames):
+        """A complete, non-empty upstream answer."""
+        return [aws_frames.content("Hello") + aws_frames.metering(0.1) + aws_frames.context_usage(1.0)]
+
+    @staticmethod
+    def _post(test_client, key, stream, model="claude-sonnet-5.5", **extra):
+        """POSTs a chat completion with reasoning_effort=medium by default."""
+        body = {
+            "model": model, "stream": stream, "reasoning_effort": "medium",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        body.update(extra)
+        return test_client.post(
+            "/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body
+        )
+
+    def _capture_payload(self, test_client, key, mock_httpx_response, aws_frames, stream, **kwargs):
+        """Runs a request with KiroHttpClient mocked; returns (response, payload sent to Kiro)."""
+        with patch("kiro.routes_openai.KiroHttpClient") as client_class:
+            instance = AsyncMock()
+            instance.request_with_retry = AsyncMock(
+                return_value=mock_httpx_response(status_code=200, stream_chunks=self._ok_frames(aws_frames))
+            )
+            instance.close = AsyncMock()
+            client_class.return_value = instance
+            response = self._post(test_client, key, stream, **kwargs)
+        payload = instance.request_with_retry.call_args.args[2]
+        return response, payload
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_claude_shaped_model_gets_output_config(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        schema_model_cache, account_system, stream
+    ):
+        """
+        What it does: reasoning_effort=medium on claude-sonnet-5.5 through each of the four paths.
+        Goal: Top-level additionalModelRequestFields == output_config.effort medium (no thinking).
+        """
+        manager = self._install_account_manager(test_client.app.state, monkeypatch, account_system, schema_model_cache)
+
+        response, payload = self._capture_payload(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream
+        )
+
+        assert response.status_code == 200
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        if account_system:
+            manager.get_next_account.assert_awaited()
+        else:
+            manager.get_next_account.assert_not_awaited()
+            manager.get_first_account.assert_called()
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_gpt_shaped_model_gets_reasoning(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        schema_model_cache, account_system, stream
+    ):
+        """
+        What it does: reasoning_effort=medium on gpt-5.6-luna through each of the four paths.
+        Goal: Only reasoning.effort.
+        """
+        self._install_account_manager(test_client.app.state, monkeypatch, account_system, schema_model_cache)
+
+        _, payload = self._capture_payload(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream, model="gpt-5.6-luna"
+        )
+
+        assert payload["additionalModelRequestFields"] == {"reasoning": {"effort": "medium"}}
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    @pytest.mark.parametrize("model", ["claude-sonnet-4-5", "claude-haiku-4-5", "unknown-model"])
+    def test_models_without_schema_send_no_field(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        schema_model_cache, account_system, stream, model
+    ):
+        """
+        What it does: sonnet-4.5 / haiku-4.5 (null schema) and an uncached model on every path.
+        Goal: No additionalModelRequestFields.
+        """
+        self._install_account_manager(test_client.app.state, monkeypatch, account_system, schema_model_cache)
+
+        response, payload = self._capture_payload(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream, model=model
+        )
+
+        assert response.status_code == 200
+        assert "additionalModelRequestFields" not in payload
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_switch_off_and_missing_effort_send_no_field(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        schema_model_cache, account_system, stream
+    ):
+        """
+        What it does: Switch off, and a request without reasoning_effort.
+        Goal: No field in either case.
+        """
+        self._install_account_manager(test_client.app.state, monkeypatch, account_system, schema_model_cache)
+
+        with patch("kiro.model_request_fields.FORWARD_MODEL_REQUEST_FIELDS", False):
+            _, off_payload = self._capture_payload(
+                test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream
+            )
+        _, no_effort_payload = self._capture_payload(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream, reasoning_effort=None
+        )
+
+        assert "additionalModelRequestFields" not in off_payload
+        assert "additionalModelRequestFields" not in no_effort_payload
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_magicmock_model_cache_still_works(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, stream
+    ):
+        """
+        What it does: A MagicMock model cache (shape used by older tests).
+        Goal: Request succeeds and no field is sent.
+        """
+        cache = MagicMock()
+        cache.get_max_input_tokens.return_value = 200000
+        self._install_account_manager(test_client.app.state, monkeypatch, account_system, cache)
+
+        response, payload = self._capture_payload(
+            test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, stream
+        )
+
+        assert response.status_code == 200
+        assert "additionalModelRequestFields" not in payload
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_400_fallback_end_to_end(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, scripted_httpx_client,
+        monkeypatch, schema_model_cache, account_system, stream
+    ):
+        """
+        What it does: REAL KiroHttpClient; Kiro answers 400 (field rejected), then 200.
+        Goal: Client gets 200; the second send has no field; the account is NOT reported as failed.
+        """
+        from kiro.http_client import KiroHttpClient
+
+        manager = self._install_account_manager(test_client.app.state, monkeypatch, account_system, schema_model_cache)
+        rejected = mock_httpx_response(status_code=400)
+        rejected.aread = AsyncMock(return_value=self.REJECTION)
+        ok = mock_httpx_response(status_code=200, stream_chunks=self._ok_frames(aws_frames))
+        fake = scripted_httpx_client([rejected, ok])
+
+        with patch.object(KiroHttpClient, "_get_client", new=AsyncMock(return_value=fake)), \
+                patch("kiro.http_client.get_kiro_headers", return_value={}):
+            response = self._post(test_client, valid_proxy_api_key, stream)
+
+        assert response.status_code == 200
+        assert len(fake.sent_bodies) == 2
+        assert fake.sent_bodies[0]["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        assert "additionalModelRequestFields" not in fake.sent_bodies[1]
+        manager.report_failure.assert_not_awaited()
+
+    def test_unrelated_400_is_still_reported_as_failure(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, scripted_httpx_client, monkeypatch,
+        schema_model_cache
+    ):
+        """
+        What it does: Real KiroHttpClient; a 400 that does not mention the field (account-system branch).
+        Goal: Not swallowed: one send, error status reaches the client, normal failure reporting runs.
+        """
+        from kiro.http_client import KiroHttpClient
+
+        manager = self._install_account_manager(test_client.app.state, monkeypatch, True, schema_model_cache)
+        rejected = mock_httpx_response(status_code=400)
+        rejected.aread = AsyncMock(return_value=b'{"message":"Improperly formed request.","reason":null}')
+        rejected.text = '{"message":"Improperly formed request.","reason":null}'
+        fake = scripted_httpx_client([rejected])
+
+        with patch.object(KiroHttpClient, "_get_client", new=AsyncMock(return_value=fake)), \
+                patch("kiro.http_client.get_kiro_headers", return_value={}):
+            response = self._post(test_client, valid_proxy_api_key, False)
+
+        assert response.status_code >= 400
+        assert len(fake.sent_bodies) == 1
+        assert "additionalModelRequestFields" in fake.sent_bodies[0]
+        manager.report_failure.assert_awaited()

@@ -11,6 +11,7 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 - Thinking tag injection
 """
 
+import json
 import os
 import pytest
 from unittest.mock import patch
@@ -6455,3 +6456,102 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestBuildKiroPayloadAdditionalModelRequestFields:
+    """Tests for the additional_model_request_fields parameter of build_kiro_payload."""
+
+    FIELDS = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}
+
+    @staticmethod
+    def _build(**kwargs):
+        """Builds a minimal payload and returns it."""
+        return build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Hello")],
+            system_prompt="",
+            model_id="claude-sonnet-5.5",
+            tools=None,
+            conversation_id="conv-1",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False, budget_tokens=None),
+            **kwargs,
+        ).payload
+
+    def test_fields_are_written_to_the_top_level(self):
+        """
+        What it does: Passes a translated dict.
+        Purpose: It appears equal and at the top level, next to conversationState (not nested).
+        """
+        payload = self._build(additional_model_request_fields=self.FIELDS)
+
+        assert payload["additionalModelRequestFields"] == self.FIELDS
+        assert "additionalModelRequestFields" not in payload["conversationState"]
+        assert "additionalModelRequestFields" not in payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert payload["profileArn"] == "arn:aws:test"
+
+    @pytest.mark.parametrize("value", [None, {}])
+    def test_none_and_empty_leave_the_key_out(self, value):
+        """
+        What it does: None and an empty dict.
+        Purpose: The key must be absent (not null) so the request equals the old behavior.
+        """
+        payload = self._build(additional_model_request_fields=value)
+
+        assert "additionalModelRequestFields" not in payload
+
+    def test_default_payload_is_unchanged(self):
+        """
+        What it does: Omits the parameter completely.
+        Purpose: Old callers get byte-identical payloads.
+        """
+        assert self._build() == self._build(additional_model_request_fields=None)
+
+    def test_payload_is_json_serializable(self):
+        """
+        What it does: Serializes the payload.
+        Purpose: The sender does json.dumps(payload).
+        """
+        payload = self._build(additional_model_request_fields=self.FIELDS)
+
+        assert json.loads(json.dumps(payload))["additionalModelRequestFields"] == self.FIELDS
+
+    def test_fields_survive_auto_trim(self, monkeypatch):
+        """
+        What it does: Forces AUTO_TRIM_PAYLOAD with a tiny limit on a long history.
+        Purpose: Trimming only touches history; the new top-level key stays.
+        """
+        monkeypatch.setattr("kiro.converters_core.AUTO_TRIM_PAYLOAD", True)
+        monkeypatch.setattr("kiro.converters_core.KIRO_MAX_PAYLOAD_BYTES", 500)
+        messages = []
+        for i in range(30):
+            messages.append(UnifiedMessage(role="user", content=f"question {i} " + "x" * 200))
+            messages.append(UnifiedMessage(role="assistant", content=f"answer {i} " + "y" * 200))
+        messages.append(UnifiedMessage(role="user", content="last"))
+
+        payload = build_kiro_payload(
+            messages=messages, system_prompt="", model_id="claude-sonnet-5.5", tools=None,
+            conversation_id="c", profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False, budget_tokens=None),
+            additional_model_request_fields=self.FIELDS,
+        ).payload
+
+        assert payload["additionalModelRequestFields"] == self.FIELDS
+
+    @pytest.mark.parametrize("fake_reasoning", [True, False])
+    def test_fake_reasoning_does_not_change_the_field(self, monkeypatch, fake_reasoning):
+        """
+        What it does: Builds with FAKE_REASONING on and off.
+        Purpose: The tag injection path and the structured field are independent.
+        """
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", fake_reasoning)
+
+        payload = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Hello")], system_prompt="",
+            model_id="claude-sonnet-5.5", tools=None, conversation_id="c", profile_arn="",
+            thinking_config=ThinkingConfig(enabled=True, budget_tokens=4000),
+            additional_model_request_fields=self.FIELDS,
+        ).payload
+
+        content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        assert payload["additionalModelRequestFields"] == self.FIELDS
+        assert ("<thinking_mode>" in content) is fake_reasoning

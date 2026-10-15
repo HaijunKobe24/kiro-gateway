@@ -66,7 +66,8 @@ class ModelInfoCache:
         """
         Updates the model cache.
         
-        Thread-safely replaces cache contents with new data.
+        Thread-safely replaces cache contents with new data. Entries are stored
+        unchanged, including additionalModelRequestFieldsSchema.
         
         Args:
             models_data: List of dictionaries with model information.
@@ -141,6 +142,25 @@ class ModelInfoCache:
             return model["tokenLimits"].get("maxInputTokens") or DEFAULT_MAX_INPUT_TOKENS
         return DEFAULT_MAX_INPUT_TOKENS
     
+    def get_additional_fields_schema(self, model_id: str) -> Any:
+        """
+        Returns the raw additionalModelRequestFieldsSchema of a model.
+
+        The value is returned unchanged (a dict, a JSON string or None); parsing and
+        validation belong to kiro.model_request_fields.
+
+        Args:
+            model_id: Model ID
+
+        Returns:
+            The raw schema value, or None when the model is not cached, the entry is
+            malformed, or the model has no schema (fallback and hidden models never have one)
+        """
+        model = self._cache.get(model_id)
+        if not isinstance(model, dict):
+            return None
+        return model.get("additionalModelRequestFieldsSchema")
+
     def is_empty(self) -> bool:
         """
         Checks if the cache is empty.

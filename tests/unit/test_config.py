@@ -969,3 +969,387 @@ class TestAccountSystemConfig:
         
         print(f"Comparing STATE_SAVE_INTERVAL_SECONDS: Expected 10, Got {config_module.STATE_SAVE_INTERVAL_SECONDS}")
         assert config_module.STATE_SAVE_INTERVAL_SECONDS == 10
+
+class TestFakeReasoningAsTextModes:
+    """Tests for FAKE_REASONING_AS_TEXT_MODES (modes that emit thinking as regular text)."""
+
+    def test_text_modes_cover_pass_and_strip_tags_but_not_structured_modes(self):
+        """
+        What it does: Checks the contents of FAKE_REASONING_AS_TEXT_MODES.
+        Purpose: "pass" / "strip_tags" (documented as keeping thinking in regular content)
+        and the legacy "include_as_text" are text modes; "as_reasoning_content" and
+        "remove" must never be.
+        """
+        from kiro.config import FAKE_REASONING_AS_TEXT_MODES
+
+        print(f"Modes: {FAKE_REASONING_AS_TEXT_MODES}")
+        assert "pass" in FAKE_REASONING_AS_TEXT_MODES
+        assert "strip_tags" in FAKE_REASONING_AS_TEXT_MODES
+        assert "include_as_text" in FAKE_REASONING_AS_TEXT_MODES
+        assert "as_reasoning_content" not in FAKE_REASONING_AS_TEXT_MODES
+        assert "remove" not in FAKE_REASONING_AS_TEXT_MODES
+
+    def test_every_valid_handling_value_is_classified_exactly_once(self):
+        """
+        What it does: Classifies the four valid FAKE_REASONING_HANDLING values.
+        Purpose: Each valid value is either a text mode or a structured/discard mode - never both.
+        """
+        from kiro.config import FAKE_REASONING_AS_TEXT_MODES
+
+        structured = {"as_reasoning_content", "remove"}
+        for value in ("as_reasoning_content", "remove", "pass", "strip_tags"):
+            assert (value in FAKE_REASONING_AS_TEXT_MODES) != (value in structured), value
+
+
+class TestEmptyResponseConfig:
+    """Tests for EMPTY_RESPONSE_AS_ERROR and EMPTY_RESPONSE_ERROR_STATUS configuration."""
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self, monkeypatch):
+        """Reloads kiro.config with the real environment after each test."""
+        yield
+        monkeypatch.undo()
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+    @staticmethod
+    def _reload(monkeypatch, **env):
+        """
+        Reloads kiro.config with the given environment overrides.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture
+            **env: Environment variables to set (None removes the variable)
+
+        Returns:
+            The reloaded kiro.config module
+        """
+        from importlib import reload
+        import kiro.config as config_module
+
+        for name, value in env.items():
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        return reload(config_module)
+
+    def test_defaults_enabled_with_status_503(self, monkeypatch):
+        """
+        What it does: Removes both variables and reloads the config.
+        Purpose: Empty upstream responses must be converted to errors by default, with 503.
+        """
+        config_module = self._reload(
+            monkeypatch, EMPTY_RESPONSE_AS_ERROR=None, EMPTY_RESPONSE_ERROR_STATUS=None
+        )
+
+        print(f"EMPTY_RESPONSE_AS_ERROR={config_module.EMPTY_RESPONSE_AS_ERROR}, "
+              f"EMPTY_RESPONSE_ERROR_STATUS={config_module.EMPTY_RESPONSE_ERROR_STATUS}")
+        assert config_module.EMPTY_RESPONSE_AS_ERROR is True
+        assert config_module.EMPTY_RESPONSE_ERROR_STATUS == 503
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES", " true", "true ", " yes "])
+    def test_truthy_values_enable(self, monkeypatch, raw):
+        """
+        What it does: Sets EMPTY_RESPONSE_AS_ERROR to each accepted truthy spelling.
+        Purpose: Boolean parsing must match the project's existing true/1/yes convention.
+        """
+        config_module = self._reload(monkeypatch, EMPTY_RESPONSE_AS_ERROR=raw)
+
+        assert config_module.EMPTY_RESPONSE_AS_ERROR is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no", "off", "garbage", "", "tru"])
+    def test_falsy_and_invalid_values_disable(self, monkeypatch, raw):
+        """
+        What it does: Sets EMPTY_RESPONSE_AS_ERROR to false-like and invalid values.
+        Purpose: Anything that is not true/1/yes restores the native pass-through behavior.
+        """
+        config_module = self._reload(monkeypatch, EMPTY_RESPONSE_AS_ERROR=raw)
+
+        print(f"{raw!r} -> {config_module.EMPTY_RESPONSE_AS_ERROR}")
+        assert config_module.EMPTY_RESPONSE_AS_ERROR is False
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("500", 500), ("503", 503), ("529", 529), ("599", 599), (" 502 ", 502), ("+504", 504),
+    ])
+    def test_valid_status_values_are_used(self, monkeypatch, raw, expected):
+        """
+        What it does: Sets EMPTY_RESPONSE_ERROR_STATUS to values in 500-599.
+        Purpose: Operators can pick the status their client retries on.
+        """
+        config_module = self._reload(monkeypatch, EMPTY_RESPONSE_ERROR_STATUS=raw)
+
+        assert config_module.EMPTY_RESPONSE_ERROR_STATUS == expected
+
+    @pytest.mark.parametrize("raw", ["499", "600", "0", "-1", "-503", "abc", "", "50 3", "503.5", "5e2", "200", "99999"])
+    def test_invalid_status_values_fall_back_to_503(self, monkeypatch, raw):
+        """
+        What it does: Sets EMPTY_RESPONSE_ERROR_STATUS to out-of-range and malformed values.
+        Purpose: A typo must never produce a 2xx/3xx/4xx status or crash the import.
+        """
+        config_module = self._reload(monkeypatch, EMPTY_RESPONSE_ERROR_STATUS=raw)
+
+        print(f"{raw!r} -> {config_module.EMPTY_RESPONSE_ERROR_STATUS}")
+        assert config_module.EMPTY_RESPONSE_ERROR_STATUS == 503
+
+    def test_parse_helper_handles_boundaries(self):
+        """
+        What it does: Calls _parse_empty_response_status directly at the range edges.
+        Purpose: 500 and 599 are accepted, 499 and 600 are rejected.
+        """
+        from kiro.config import _parse_empty_response_status
+
+        assert _parse_empty_response_status("500") == 500
+        assert _parse_empty_response_status("599") == 599
+        assert _parse_empty_response_status("499") == 503
+        assert _parse_empty_response_status("600") == 503
+
+
+class TestIncompleteResponseConfig:
+    """Tests for INCOMPLETE_RESPONSE_AS_ERROR, INCOMPLETE_RESPONSE_ERROR_TYPE and _parse_switch."""
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self, monkeypatch):
+        """Reloads kiro.config with the real environment after each test."""
+        yield
+        monkeypatch.undo()
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+    @staticmethod
+    def _reload(monkeypatch, **env):
+        """
+        Reloads kiro.config with the given environment overrides and collects its WARNINGs.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture
+            **env: Environment variables to set (None removes the variable)
+
+        Returns:
+            Tuple of (reloaded kiro.config module, list of WARNING messages logged while loading)
+        """
+        from importlib import reload
+        import kiro.config as config_module
+        from loguru import logger
+
+        for name, value in env.items():
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        warnings = []
+        handler_id = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{message}")
+        try:
+            module = reload(config_module)
+        finally:
+            logger.remove(handler_id)
+        return module, warnings
+
+    def test_defaults(self, monkeypatch):
+        """
+        What it does: Removes both variables and reloads the config.
+        Purpose: Switch ON and type overloaded_error by default, without any warning.
+        """
+        config_module, warnings = self._reload(
+            monkeypatch, INCOMPLETE_RESPONSE_AS_ERROR=None, INCOMPLETE_RESPONSE_ERROR_TYPE=None,
+            EMPTY_RESPONSE_AS_ERROR=None,
+        )
+
+        assert config_module.INCOMPLETE_RESPONSE_AS_ERROR is True
+        assert config_module.INCOMPLETE_RESPONSE_ERROR_TYPE == "overloaded_error"
+        assert not [w for w in warnings if "INCOMPLETE_RESPONSE" in w]
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "YES", " true ", "\tyes\n"])
+    def test_truthy_values_enable_without_warning(self, monkeypatch, raw):
+        """
+        What it does: Each accepted truthy spelling, also with surrounding whitespace.
+        Purpose: Same parsing as EMPTY_RESPONSE_AS_ERROR, plus strip().
+        """
+        config_module, warnings = self._reload(monkeypatch, INCOMPLETE_RESPONSE_AS_ERROR=raw)
+
+        assert config_module.INCOMPLETE_RESPONSE_AS_ERROR is True
+        assert not [w for w in warnings if "INCOMPLETE_RESPONSE_AS_ERROR" in w]
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no", "off", "", " false "])
+    def test_falsy_values_disable_without_warning(self, monkeypatch, raw):
+        """
+        What it does: Each accepted falsy spelling.
+        Purpose: Switch OFF restores pass-through and is silent.
+        """
+        config_module, warnings = self._reload(monkeypatch, INCOMPLETE_RESPONSE_AS_ERROR=raw)
+
+        assert config_module.INCOMPLETE_RESPONSE_AS_ERROR is False
+        assert not [w for w in warnings if "INCOMPLETE_RESPONSE_AS_ERROR" in w]
+
+    @pytest.mark.parametrize("raw", ["ture", "tru", "enable", "2", "on"])
+    def test_unrecognized_values_disable_with_startup_warning(self, monkeypatch, raw):
+        """
+        What it does: Typos and unknown spellings.
+        Purpose: Historical semantics kept (treated as false) but made visible by a WARNING.
+        """
+        config_module, warnings = self._reload(monkeypatch, INCOMPLETE_RESPONSE_AS_ERROR=raw)
+
+        assert config_module.INCOMPLETE_RESPONSE_AS_ERROR is False
+        matching = [w for w in warnings if "INCOMPLETE_RESPONSE_AS_ERROR" in w]
+        assert len(matching) == 1 and repr(raw) in matching[0]
+
+    def test_empty_response_switch_warns_on_typo_and_strips(self, monkeypatch):
+        """
+        What it does: EMPTY_RESPONSE_AS_ERROR with a typo, then with padded "true".
+        Purpose: The existing switch shares the parser: typo -> False + WARNING, " true " -> True.
+        """
+        config_module, warnings = self._reload(monkeypatch, EMPTY_RESPONSE_AS_ERROR="ture")
+        assert config_module.EMPTY_RESPONSE_AS_ERROR is False
+        assert [w for w in warnings if "EMPTY_RESPONSE_AS_ERROR" in w]
+
+        config_module, warnings = self._reload(monkeypatch, EMPTY_RESPONSE_AS_ERROR=" true ")
+        assert config_module.EMPTY_RESPONSE_AS_ERROR is True
+        assert not [w for w in warnings if "EMPTY_RESPONSE_AS_ERROR" in w]
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("overloaded_error", "overloaded_error"),
+        ("api_error", "api_error"),
+        (" API_ERROR ", "api_error"),
+        ("Overloaded_Error", "overloaded_error"),
+    ])
+    def test_error_type_is_normalized(self, monkeypatch, raw, expected):
+        """
+        What it does: Allowed values in odd spellings.
+        Purpose: strip + lower, no warning.
+        """
+        config_module, warnings = self._reload(monkeypatch, INCOMPLETE_RESPONSE_ERROR_TYPE=raw)
+
+        assert config_module.INCOMPLETE_RESPONSE_ERROR_TYPE == expected
+        assert not [w for w in warnings if "INCOMPLETE_RESPONSE_ERROR_TYPE" in w]
+
+    @pytest.mark.parametrize("raw", ["foo", "", "rate_limit_error", "invalid_request_error", "overloaded", "null", "123"])
+    def test_invalid_error_type_falls_back_with_warning(self, monkeypatch, raw):
+        """
+        What it does: Values outside the whitelist.
+        Purpose: Fall back to overloaded_error and log one WARNING; never raise.
+        """
+        config_module, warnings = self._reload(monkeypatch, INCOMPLETE_RESPONSE_ERROR_TYPE=raw)
+
+        assert config_module.INCOMPLETE_RESPONSE_ERROR_TYPE == "overloaded_error"
+        assert len([w for w in warnings if "INCOMPLETE_RESPONSE_ERROR_TYPE" in w]) == 1
+
+    def test_status_setting_is_reused_unchanged(self, monkeypatch):
+        """
+        What it does: EMPTY_RESPONSE_ERROR_STATUS with the incomplete switch present.
+        Purpose: No new status setting; the existing one keeps working.
+        """
+        config_module, _ = self._reload(monkeypatch, EMPTY_RESPONSE_ERROR_STATUS="529")
+
+        assert config_module.EMPTY_RESPONSE_ERROR_STATUS == 529
+        assert not hasattr(config_module, "INCOMPLETE_RESPONSE_ERROR_STATUS")
+
+    def test_env_example_documents_both_new_variables(self):
+        """
+        What it does: Reads .env.example (the committed template, never .env).
+        Purpose: Both new options must be documented there, with their defaults.
+        """
+        from pathlib import Path
+
+        text = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
+
+        assert "# INCOMPLETE_RESPONSE_AS_ERROR=true" in text
+        assert "# INCOMPLETE_RESPONSE_ERROR_TYPE=overloaded_error" in text
+
+
+class TestForwardModelRequestFieldsConfig:
+    """Tests for the FORWARD_MODEL_REQUEST_FIELDS switch."""
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self, monkeypatch):
+        """Reloads kiro.config with the real environment after each test."""
+        yield
+        monkeypatch.undo()
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+    @staticmethod
+    def _reload(monkeypatch, **env):
+        """
+        Reloads kiro.config with the given environment overrides and collects its WARNINGs.
+
+        Args:
+            monkeypatch: pytest monkeypatch fixture
+            **env: Environment variables to set (None removes the variable)
+
+        Returns:
+            Tuple of (reloaded kiro.config module, list of WARNING messages logged while loading)
+        """
+        from importlib import reload
+        import kiro.config as config_module
+        from loguru import logger
+
+        for name, value in env.items():
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        warnings = []
+        handler_id = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{message}")
+        try:
+            module = reload(config_module)
+        finally:
+            logger.remove(handler_id)
+        return module, warnings
+
+    def test_default_is_enabled_without_warning(self, monkeypatch):
+        """
+        What it does: Removes the variable and reloads the config.
+        Purpose: The switch is ON by default and silent.
+        """
+        config_module, warnings = self._reload(monkeypatch, FORWARD_MODEL_REQUEST_FIELDS=None)
+
+        assert config_module.FORWARD_MODEL_REQUEST_FIELDS is True
+        assert not [w for w in warnings if "FORWARD_MODEL_REQUEST_FIELDS" in w]
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", " true ", " yes "])
+    def test_truthy_values_enable_without_warning(self, monkeypatch, raw):
+        """
+        What it does: Each accepted truthy spelling, also padded.
+        Purpose: Same parsing as the other switches (strip + lower).
+        """
+        config_module, warnings = self._reload(monkeypatch, FORWARD_MODEL_REQUEST_FIELDS=raw)
+
+        assert config_module.FORWARD_MODEL_REQUEST_FIELDS is True
+        assert not [w for w in warnings if "FORWARD_MODEL_REQUEST_FIELDS" in w]
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no", "off", "", " false "])
+    def test_falsy_values_disable_without_warning(self, monkeypatch, raw):
+        """
+        What it does: Each accepted falsy spelling.
+        Purpose: Switch OFF restores the old behavior (field never sent) and is silent.
+        """
+        config_module, warnings = self._reload(monkeypatch, FORWARD_MODEL_REQUEST_FIELDS=raw)
+
+        assert config_module.FORWARD_MODEL_REQUEST_FIELDS is False
+        assert not [w for w in warnings if "FORWARD_MODEL_REQUEST_FIELDS" in w]
+
+    @pytest.mark.parametrize("raw", ["garbage", "tru", "ture", "on", "2"])
+    def test_unrecognized_values_disable_with_startup_warning(self, monkeypatch, raw):
+        """
+        What it does: Typos and unknown spellings.
+        Purpose: Treated as false but made visible by exactly one startup WARNING.
+        """
+        config_module, warnings = self._reload(monkeypatch, FORWARD_MODEL_REQUEST_FIELDS=raw)
+
+        assert config_module.FORWARD_MODEL_REQUEST_FIELDS is False
+        matching = [w for w in warnings if "FORWARD_MODEL_REQUEST_FIELDS" in w]
+        assert len(matching) == 1 and repr(raw) in matching[0]
+
+    def test_env_example_documents_the_switch(self):
+        """
+        What it does: Reads .env.example (the committed template, never .env).
+        Purpose: The option must be documented there with its default.
+        """
+        from pathlib import Path
+
+        text = (Path(__file__).resolve().parents[2] / ".env.example").read_text(encoding="utf-8")
+
+        assert "# FORWARD_MODEL_REQUEST_FIELDS=true" in text

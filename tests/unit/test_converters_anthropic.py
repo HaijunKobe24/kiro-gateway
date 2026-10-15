@@ -12,6 +12,7 @@ Tests for Anthropic Messages API to Kiro format conversion:
 - Full Anthropic → Kiro payload conversion
 """
 
+import json
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -1941,3 +1942,190 @@ class TestInlineSystemMessageCompatibility:
         assert "Top-level instructions" in current_content
         assert "Inline instructions" in current_content
         assert state.get("history", []) == []
+
+
+
+class TestAnthropicModelRequestFields:
+    """Tests for thinking / effort forwarding into additionalModelRequestFields."""
+
+    CLAUDE_CODE_EXTRA = {
+        "thinking": {"type": "adaptive", "display": "updates"},
+        "output_config": {"effort": "medium"},
+        "max_tokens": 64000,
+        "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+    }
+
+    @classmethod
+    def _request(cls, model="claude-sonnet-5.5", **overrides):
+        """Builds a Claude Code shaped Anthropic request."""
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Hello"}],
+            **cls.CLAUDE_CODE_EXTRA,
+        }
+        data.update(overrides)
+        data = {k: v for k, v in data.items() if v is not None or k in ("thinking",)}
+        return AnthropicMessagesRequest(**data)
+
+    @staticmethod
+    def _convert(request, cache):
+        """Runs anthropic_to_kiro with the real model resolver and FAKE_REASONING off."""
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            return anthropic_to_kiro(request, "conv-1", "arn:aws:test", model_cache=cache)
+
+    def test_claude_code_request_on_sonnet_55(self, schema_model_cache):
+        """
+        What it does: Real Claude Code shape (adaptive + display "updates" + effort medium).
+        Purpose: Top-level fields have the effort and thinking.type, display is dropped.
+        """
+        payload = self._convert(self._request(), schema_model_cache)
+
+        assert payload["additionalModelRequestFields"] == {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "medium"},
+        }
+        assert "max_tokens" not in json.dumps(payload["additionalModelRequestFields"])
+        assert "context_management" not in json.dumps(payload["additionalModelRequestFields"])
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5-5-20261001", "claude-sonnet-5.5"])
+    def test_model_name_variants_resolve_to_the_same_schema(self, schema_model_cache, model):
+        """
+        What it does: Dashed, dated and dotted spellings of the model.
+        Purpose: Lookup uses the resolver-normalized internal id.
+        """
+        payload = self._convert(self._request(model=model), schema_model_cache)
+
+        assert payload["additionalModelRequestFields"]["output_config"] == {"effort": "medium"}
+
+    @pytest.mark.parametrize("model", ["claude-sonnet-4-5", "claude-haiku-4-5", "deepseek-3.2", "some-unknown-model"])
+    def test_models_without_schema_get_no_field(self, schema_model_cache, model):
+        """
+        What it does: sonnet-4.5, haiku-4.5, deepseek and an unknown model.
+        Purpose: Schema is null / missing -> key absent (old behavior).
+        """
+        payload = self._convert(self._request(model=model), schema_model_cache)
+
+        assert "additionalModelRequestFields" not in payload
+
+    def test_dashed_fable_is_a_known_normalization_boundary(self, schema_model_cache):
+        """
+        What it does: claude-fable-5-1 (dashed).
+        Purpose: Pins the current model_resolver boundary: it is not normalized to 5.1, so the
+        schema is not found and nothing is sent. The dotted spelling works.
+        """
+        dashed = self._convert(self._request(model="claude-fable-5-1"), schema_model_cache)
+        dotted = self._convert(self._request(model="claude-fable-5.1"), schema_model_cache)
+
+        assert "additionalModelRequestFields" not in dashed
+        assert dotted["additionalModelRequestFields"]["output_config"] == {"effort": "medium"}
+
+    def test_gpt_model_gets_only_reasoning(self, schema_model_cache):
+        """
+        What it does: Same request against gpt-5.6-luna.
+        Purpose: Only reasoning.effort; no thinking / output_config.
+        """
+        payload = self._convert(self._request(model="gpt-5.6-luna"), schema_model_cache)
+
+        assert payload["additionalModelRequestFields"] == {"reasoning": {"effort": "medium"}}
+
+    def test_without_model_cache_nothing_is_sent(self):
+        """
+        What it does: Omits model_cache.
+        Purpose: Identical to the pre-feature payload.
+        """
+        request = self._request()
+
+        with_none = self._convert(request, None)
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+            legacy = anthropic_to_kiro(request, "conv-1", "arn:aws:test")
+
+        assert "additionalModelRequestFields" not in with_none
+        assert legacy == with_none
+
+    def test_switch_off_restores_old_payload(self, schema_model_cache):
+        """
+        What it does: FORWARD_MODEL_REQUEST_FIELDS=False.
+        Purpose: Payload equals the one built without a cache.
+        """
+        request = self._request()
+        baseline = self._convert(request, None)
+
+        with patch("kiro.model_request_fields.FORWARD_MODEL_REQUEST_FIELDS", False):
+            payload = self._convert(request, schema_model_cache)
+
+        assert payload == baseline
+
+    @pytest.mark.parametrize("output_config", ["high", ["high"], None, {}, {"effort": None}, {"format": {"type": "json"}}])
+    def test_odd_output_config_values_never_raise(self, schema_model_cache, output_config):
+        """
+        What it does: output_config as string, list, null, empty, without effort, only format.
+        Purpose: No effort is forwarded; thinking still is.
+        """
+        payload = self._convert(self._request(output_config=output_config), schema_model_cache)
+
+        assert payload["additionalModelRequestFields"] == {"thinking": {"type": "adaptive"}}
+
+    def test_output_config_extra_keys_are_not_forwarded(self, schema_model_cache):
+        """
+        What it does: output_config with effort plus format.
+        Purpose: Only effort is read.
+        """
+        payload = self._convert(
+            self._request(output_config={"effort": "high", "format": {"type": "json_schema"}}), schema_model_cache
+        )
+
+        assert payload["additionalModelRequestFields"]["output_config"] == {"effort": "high"}
+
+    def test_no_thinking_and_no_output_config(self, schema_model_cache):
+        """
+        What it does: A request with neither.
+        Purpose: Key absent.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-5.5", messages=[{"role": "user", "content": "Hi"}], max_tokens=10
+        )
+
+        assert "additionalModelRequestFields" not in self._convert(request, schema_model_cache)
+
+    def test_disabled_thinking_is_dropped_but_tag_behavior_is_unchanged(self, schema_model_cache):
+        """
+        What it does: thinking.disabled on sonnet-5.5 (enum has no disabled) with FAKE_REASONING on.
+        Purpose: No thinking field, effort still sent, and no tag injection (ThinkingConfig disabled).
+        """
+        request = self._request(thinking={"type": "disabled"})
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            payload = anthropic_to_kiro(request, "conv-1", "arn:aws:test", model_cache=schema_model_cache)
+            baseline = anthropic_to_kiro(request, "conv-1", "arn:aws:test")
+
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        # Conversation content (tag injection / system prompt addition) is identical without the cache
+        payload.pop("additionalModelRequestFields")
+        assert payload == baseline
+
+    def test_hints_extraction(self):
+        """
+        What it does: Calls extract_model_request_hints_from_anthropic directly.
+        Purpose: Returns (thinking, effort) exactly as sent, None when absent.
+        """
+        from kiro.converters_anthropic import extract_model_request_hints_from_anthropic
+
+        assert extract_model_request_hints_from_anthropic(self._request()) == (
+            {"type": "adaptive", "display": "updates"}, "medium"
+        )
+        bare = AnthropicMessagesRequest(model="m", messages=[{"role": "user", "content": "x"}], max_tokens=1)
+        assert extract_model_request_hints_from_anthropic(bare) == (None, None)
+
+    def test_sentinel_message_text_is_never_logged(self, schema_model_cache, loguru_messages):
+        """
+        What it does: Conversation text with a sentinel plus an invalid effort.
+        Purpose: The new log lines never include message content.
+        """
+        request = self._request(
+            messages=[{"role": "user", "content": "SECRET-SENTINEL"}], output_config={"effort": "ultra"}
+        )
+        self._convert(request, schema_model_cache)
+
+        field_logs = [m for m in loguru_messages if "additional" in m.lower() or "forwarding" in m.lower()]
+        assert field_logs
+        assert not [m for m in field_logs if "SECRET-SENTINEL" in m]

@@ -24,11 +24,13 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from kiro.cache import ModelInfoCache
 from kiro.config import HIDDEN_MODELS
+from kiro.model_request_fields import resolve_additional_model_request_fields, summarize_fields
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -448,8 +450,31 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
+def extract_model_request_hints_from_anthropic(request: AnthropicMessagesRequest) -> Tuple[Any, Any]:
+    """
+    Extracts the client's thinking object and effort from an Anthropic request.
+
+    Only these two hints are read; other fields (max_tokens, context_management, ...) are
+    never forwarded. "output_config" is not a declared model field, so it is read from the
+    extra fields the request model keeps.
+
+    Args:
+        request: Anthropic MessagesRequest
+
+    Returns:
+        Tuple (thinking, effort): thinking is request.thinking as sent (or None); effort is
+        output_config.effort as sent, or None when output_config is absent or not an object
+    """
+    output_config = (request.model_extra or {}).get("output_config")
+    effort = output_config.get("effort") if isinstance(output_config, dict) else None
+    return request.thinking, effort
+
+
 def anthropic_to_kiro(
-    request: AnthropicMessagesRequest, conversation_id: str, profile_arn: str
+    request: AnthropicMessagesRequest,
+    conversation_id: str,
+    profile_arn: str,
+    model_cache: Optional[ModelInfoCache] = None,
 ) -> dict:
     """
     Converts Anthropic Messages API request to Kiro API payload.
@@ -465,6 +490,8 @@ def anthropic_to_kiro(
         request: Anthropic MessagesRequest
         conversation_id: Unique conversation ID
         profile_arn: AWS CodeWhisperer profile ARN
+        model_cache: Model cache of the selected account, used to look up the target model's
+            additionalModelRequestFieldsSchema. None disables thinking / effort forwarding.
 
     Returns:
         Payload dictionary for POST request to Kiro API
@@ -494,11 +521,18 @@ def anthropic_to_kiro(
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
 
+    # Translate thinking / effort into the model's additionalModelRequestFields (schema driven)
+    client_thinking, client_effort = extract_model_request_hints_from_anthropic(request)
+    additional_fields = resolve_additional_model_request_fields(
+        model_id, model_cache, client_thinking, client_effort
+    )
+
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "
         f"messages={len(unified_messages)}, tools={len(unified_tools) if unified_tools else 0}, "
         f"system_prompt_length={len(system_prompt)}, "
-        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}"
+        f"thinking_enabled={thinking_config.enabled}, thinking_budget={thinking_config.budget_tokens}, "
+        f"additional_fields={summarize_fields(additional_fields)}"
     )
 
     # Use core function to build payload
@@ -510,6 +544,7 @@ def anthropic_to_kiro(
         conversation_id=conversation_id,
         profile_arn=profile_arn,
         thinking_config=thinking_config,
+        additional_model_request_fields=additional_fields,
     )
 
     return result.payload

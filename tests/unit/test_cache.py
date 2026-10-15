@@ -435,3 +435,109 @@ class TestModelInfoCacheThreadSafety:
         print("Проверка: Все чтения вернули одинаковый результат...")
         assert all(r is not None for r in results)
         assert all(r["modelId"] == "claude-sonnet-4" for r in results)
+
+class TestModelInfoCacheAdditionalFieldsSchema:
+    """Tests for retention and lookup of additionalModelRequestFieldsSchema."""
+
+    def test_update_retains_schema_unchanged(self, model_schemas):
+        """
+        What it does: Stores a model with a schema via update() and reads it back with get().
+        Purpose: The cache must keep the schema untouched (same content).
+        """
+        print("Arrange: model with schema")
+        schema = model_schemas.claude()
+        cache = ModelInfoCache()
+
+        print("Act: update + get")
+        asyncio.run(cache.update([{"modelId": "claude-sonnet-5.5", "additionalModelRequestFieldsSchema": schema}]))
+
+        assert cache.get("claude-sonnet-5.5")["additionalModelRequestFieldsSchema"] == schema
+
+    def test_getter_returns_dict_and_json_string_unchanged(self, model_schemas):
+        """
+        What it does: Stores one dict schema and one JSON-string schema.
+        Purpose: The getter returns the raw value; parsing is not its job.
+        """
+        cache = ModelInfoCache()
+        raw = '{"type": "object"}'
+        asyncio.run(cache.update([
+            {"modelId": "a", "additionalModelRequestFieldsSchema": model_schemas.gpt()},
+            {"modelId": "b", "additionalModelRequestFieldsSchema": raw},
+        ]))
+
+        assert cache.get_additional_fields_schema("a") == model_schemas.gpt()
+        assert cache.get_additional_fields_schema("b") == raw
+
+    def test_null_schema_returns_none(self):
+        """
+        What it does: Model with an explicit null schema, and a model without the key.
+        Purpose: Both mean "no schema" -> None.
+        """
+        cache = ModelInfoCache()
+        asyncio.run(cache.update([
+            {"modelId": "x", "additionalModelRequestFieldsSchema": None},
+            {"modelId": "y"},
+        ]))
+
+        assert cache.get_additional_fields_schema("x") is None
+        assert cache.get_additional_fields_schema("y") is None
+
+    def test_unknown_model_returns_none(self):
+        """
+        What it does: Looks up a model that is not cached (also on an empty cache).
+        Purpose: Missing model -> None, never an exception.
+        """
+        cache = ModelInfoCache()
+
+        assert cache.get_additional_fields_schema("nope") is None
+        asyncio.run(cache.update([{"modelId": "a"}]))
+        assert cache.get_additional_fields_schema("nope") is None
+
+    @pytest.mark.parametrize("entry", [None, "string", 42, ["list"]])
+    def test_malformed_entry_returns_none(self, entry):
+        """
+        What it does: Injects a non-dict cache entry directly.
+        Purpose: Corrupt data must degrade to None instead of raising.
+        """
+        cache = ModelInfoCache()
+        cache._cache["bad"] = entry
+
+        assert cache.get_additional_fields_schema("bad") is None
+
+    def test_second_update_replaces_schemas(self, model_schemas):
+        """
+        What it does: Calls update() twice with different content.
+        Purpose: Old models and their schemas vanish; new schemas are readable at once (refresh follows drift).
+        """
+        cache = ModelInfoCache()
+        asyncio.run(cache.update([{"modelId": "old", "additionalModelRequestFieldsSchema": model_schemas.gpt()}]))
+        new_schema = model_schemas.claude(type_enum=("adaptive",))
+        asyncio.run(cache.update([{"modelId": "new", "additionalModelRequestFieldsSchema": new_schema}]))
+
+        assert cache.get_additional_fields_schema("old") is None
+        assert cache.get_additional_fields_schema("new") == new_schema
+
+    def test_hidden_model_has_no_schema(self):
+        """
+        What it does: Adds a hidden model and looks up both its display name and internal id.
+        Purpose: Hidden models never carry a schema -> no field is sent.
+        """
+        cache = ModelInfoCache()
+        cache.add_hidden_model("claude-3.7-sonnet", "CLAUDE_3_7_SONNET_20250219_V1_0")
+
+        assert cache.get_additional_fields_schema("claude-3.7-sonnet") is None
+        assert cache.get_additional_fields_schema("CLAUDE_3_7_SONNET_20250219_V1_0") is None
+
+    def test_fallback_models_have_no_schema(self):
+        """
+        What it does: Loads the static FALLBACK_MODELS into the cache.
+        Purpose: Fallback entries only have modelId -> every lookup returns None.
+        """
+        from kiro.config import FALLBACK_MODELS
+
+        cache = ModelInfoCache()
+        asyncio.run(cache.update(FALLBACK_MODELS))
+
+        assert FALLBACK_MODELS
+        for model in FALLBACK_MODELS:
+            assert cache.get_additional_fields_schema(model["modelId"]) is None
