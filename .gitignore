@@ -35,3 +35,4 @@ requests/
 .coverage
 htmlcov/*.log
 kiro-gateway.pid
+.agents/
