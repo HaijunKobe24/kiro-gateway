@@ -249,6 +249,10 @@ class AwsEventStreamParser:
         ('{"input":', 'tool_input'),
         ('{"stop":', 'tool_stop'),
         ('{"followupPrompt":', 'followup'),
+        # Real meteringEvent payload starts with "unit"
+        # ({"unit":"credit","unitPlural":"credits","usage":X}); '{"usage":'
+        # covers the legacy bare shape for robustness against API format variants.
+        ('{"unit":', 'usage'),
         ('{"usage":', 'usage'),
         ('{"contextUsagePercentage":', 'context_usage'),
         # Native reasoning frames (reasoningContentEvent). A bare `{"text":` never occurs

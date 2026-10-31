@@ -97,7 +97,9 @@ class KiroEvent:
     content: Optional[str] = None
     thinking_content: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
-    usage: Optional[Dict[str, Any]] = None
+    # Real meteringEvent payload carries a numeric credit value ("usage": 0.324);
+    # Dict covers hypothetical structured shapes from API variants.
+    usage: Optional[Union[float, int, Dict[str, Any]]] = None
     context_usage_percentage: Optional[float] = None
     is_first_thinking_chunk: bool = False
     is_last_thinking_chunk: bool = False
@@ -119,7 +121,7 @@ class StreamResult:
     content: str = ""
     thinking_content: str = ""
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
-    usage: Optional[Dict[str, Any]] = None
+    usage: Optional[Union[float, int, Dict[str, Any]]] = None
     context_usage_percentage: Optional[float] = None
 
 

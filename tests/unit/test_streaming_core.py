@@ -2138,11 +2138,13 @@ class TestParseKiroStreamNativeReasoning:
     @pytest.mark.asyncio
     async def test_unknown_frames_only_yield_nothing(self, mock_response, aws_frames):
         """
-        What it does: Only unrecognized frames.
-        Goal: No thinking events appear out of thin air.
+        What it does: Unrecognized frame next to a meteringEvent (metering keeps the
+        empty-response guard satisfied).
+        Goal: Unknown frames yield no events; only the known metering event comes through.
         """
         _bytes_response(mock_response, [aws_frames.build("weirdEvent", {"foo": 1}) + aws_frames.metering(0.1)])
-        assert await _collect_events(mock_response) == []
+        events = await _collect_events(mock_response)
+        assert [(e.type, e.usage) for e in events] == [("usage", 0.1)]
 
     @pytest.mark.asyncio
     async def test_empty_text_frames_yield_no_events(self, mock_response, aws_frames):
@@ -2496,6 +2498,7 @@ class TestGuardUpstreamResponse:
         """
         What it does: contextUsageEvent + meteringEvent, no output frame.
         Purpose: A metered empty answer is the model's real answer: never an error.
+        The metering frame itself is passed through as a usage event.
         """
         data = aws_frames.context_usage(1.0) + aws_frames.metering(0.5)
         response = _stream_response([data])
@@ -2504,7 +2507,7 @@ class TestGuardUpstreamResponse:
 
         assert isinstance(guarded, GuardedResponse)
         events = await _collect_events(guarded)
-        assert [e.type for e in events] == ["context_usage"]
+        assert [(e.type, e.usage) for e in events] == [("context_usage", None), ("usage", 0.5)]
 
     @pytest.mark.asyncio
     async def test_metering_split_across_chunks_is_passed_through(self, aws_frames):

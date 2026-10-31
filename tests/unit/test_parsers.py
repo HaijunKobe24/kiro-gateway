@@ -479,6 +479,20 @@ class TestAwsEventStreamParserFeed:
         assert len(events) == 1
         assert events[0]["type"] == "usage"
         assert events[0]["data"] == 1.5
+
+    def test_parses_real_metering_event_shape(self, aws_event_parser):
+        """
+        What it does: Parses the REAL Kiro meteringEvent payload shape
+        ({"unit":"credit","unitPlural":"credits","usage":X}, verified against live captures).
+        Goal: Credits value is extracted; unit metadata is ignored.
+        """
+        chunk = b'{"unit":"credit","unitPlural":"credits","usage":0.324}'
+
+        events = aws_event_parser.feed(chunk)
+
+        assert len(events) == 1
+        assert events[0]["type"] == "usage"
+        assert events[0]["data"] == 0.324
     
     def test_parses_context_usage_event(self, aws_event_parser):
         """
@@ -1433,15 +1447,17 @@ class TestAwsEventStreamParserReasoningEvents:
     def test_event_patterns_keep_legacy_entries_and_add_reasoning(self):
         """
         What it does: Pins EVENT_PATTERNS.
-        Goal: The seven legacy patterns keep order/content; reasoning patterns are appended.
+        Goal: The legacy patterns keep order/content; the real meteringEvent shape
+        ({"unit":...}) and reasoning patterns are appended.
         """
         patterns = AwsEventStreamParser.EVENT_PATTERNS
-        assert patterns[:7] == [
+        assert patterns[:8] == [
             ('{"content":', 'content'),
             ('{"name":', 'tool_start'),
             ('{"input":', 'tool_input'),
             ('{"stop":', 'tool_stop'),
             ('{"followupPrompt":', 'followup'),
+            ('{"unit":', 'usage'),
             ('{"usage":', 'usage'),
             ('{"contextUsagePercentage":', 'context_usage'),
         ]
@@ -1873,7 +1889,7 @@ class TestAwsEventStreamParserReasoningEdgeCases:
     def test_real_shaped_stream_counts_and_order(self, aws_frames):
         """
         What it does: Reasoning x40 -> signature -> content x10 -> context usage -> metering.
-        Goal: Matches the shape of real Kiro captures (metering is not parsed - unchanged).
+        Goal: Matches the shape of real Kiro captures; meteringEvent is parsed into a usage event.
         """
         data = b"".join(
             [aws_frames.reasoning(f"r{i}") for i in range(40)]
@@ -1885,5 +1901,7 @@ class TestAwsEventStreamParserReasoningEdgeCases:
         _, events = _parse_chunks([data])
 
         assert _types(events) == (
-            ["reasoning"] * 40 + ["reasoning_signature"] + ["content"] * 10 + ["context_usage"]
+            ["reasoning"] * 40 + ["reasoning_signature"] + ["content"] * 10
+            + ["context_usage", "usage"]
         )
+        assert events[-1] == {"type": "usage", "data": 0.7}
