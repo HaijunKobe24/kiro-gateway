@@ -40,6 +40,8 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    EMPTY_CONTENT_PLACEHOLDER,
+    strip_leaked_placeholder,
 )
 
 # Test data for images - 1x1 pixel JPEG
@@ -6555,3 +6557,308 @@ class TestBuildKiroPayloadAdditionalModelRequestFields:
         content = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
         assert payload["additionalModelRequestFields"] == self.FIELDS
         assert ("<thinking_mode>" in content) is fake_reasoning
+
+
+# ==================================================================================================
+# Tests for the empty placeholder leak (assistant tool-only turns)
+# ==================================================================================================
+
+class TestStripLeakedPlaceholder:
+    """Tests for strip_leaked_placeholder function."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("(empty placeholder)", ""),
+        ("  (empty placeholder)  ", ""),
+        ("(empty placeholder)\n(empty placeholder)", ""),
+        ("(empty placeholder)\nReal text", "Real text"),
+        ("Real text\n(empty placeholder)\nMore text", "Real text\nMore text"),
+        ("Real text\n\n(empty placeholder)", "Real text"),
+    ])
+    def test_removes_placeholder_only_lines(self, text, expected):
+        """
+        What it does: Strips lines that are exactly the placeholder.
+        Purpose: Break the feedback loop where clients resend leaked placeholders.
+        """
+        assert strip_leaked_placeholder(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "",
+        "Hello",
+        "The text '(empty placeholder)' is quoted inline",
+        "prefix (empty placeholder)",
+        "(empty placeholder) suffix",
+        "(Empty Placeholder)",
+        "  indented text\nsecond line  ",
+    ])
+    def test_leaves_other_text_untouched(self, text):
+        """
+        What it does: Passes text that only mentions the placeholder or has none.
+        Purpose: Never alter legitimate content, including its whitespace.
+        """
+        assert strip_leaked_placeholder(text) == text
+
+
+class TestBuildKiroHistoryToolOnlyAssistant:
+    """Tests that tool-only assistant turns do not carry the placeholder text."""
+
+    TOOL_CALL = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "Read", "arguments": '{"file_path": "/tmp/a"}'},
+    }
+
+    def test_empty_content_with_tool_calls_stays_empty(self):
+        """
+        What it does: Builds history for an assistant turn with only tool_calls.
+        Purpose: The model must not see the placeholder as its own previous output.
+        """
+        messages = [UnifiedMessage(role="assistant", content="", tool_calls=[self.TOOL_CALL])]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assistant = result[0]["assistantResponseMessage"]
+        assert assistant["content"] == ""
+        assert len(assistant["toolUses"]) == 1
+
+    def test_none_content_with_tool_calls_stays_empty(self):
+        """
+        What it does: Same as above with content=None.
+        Purpose: None content is treated like empty content.
+        """
+        messages = [UnifiedMessage(role="assistant", content=None, tool_calls=[self.TOOL_CALL])]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assert result[0]["assistantResponseMessage"]["content"] == ""
+
+    def test_leaked_placeholder_with_tool_calls_is_cleared(self):
+        """
+        What it does: Client resends a leaked placeholder as content next to tool_calls.
+        Purpose: Already polluted conversations recover without a new session.
+        """
+        messages = [UnifiedMessage(
+            role="assistant", content=EMPTY_CONTENT_PLACEHOLDER, tool_calls=[self.TOOL_CALL]
+        )]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assistant = result[0]["assistantResponseMessage"]
+        assert assistant["content"] == ""
+        assert "toolUses" in assistant
+
+    def test_leaked_placeholder_without_tool_calls_keeps_placeholder(self):
+        """
+        What it does: Leaked placeholder, no tool calls.
+        Purpose: Kiro rejects empty content without toolUses, so the placeholder stays.
+        """
+        messages = [UnifiedMessage(role="assistant", content=EMPTY_CONTENT_PLACEHOLDER)]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assert result[0]["assistantResponseMessage"]["content"] == EMPTY_CONTENT_PLACEHOLDER
+        assert "toolUses" not in result[0]["assistantResponseMessage"]
+
+    def test_leaked_placeholder_line_removed_from_real_text(self):
+        """
+        What it does: Text with a leaked placeholder line before real text.
+        Purpose: Only the placeholder is dropped, the real text is preserved.
+        """
+        messages = [UnifiedMessage(
+            role="assistant",
+            content="(empty placeholder)\nLet me check the file",
+            tool_calls=[self.TOOL_CALL],
+        )]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assert result[0]["assistantResponseMessage"]["content"] == "Let me check the file"
+
+    def test_real_text_with_tool_calls_is_unchanged(self):
+        """
+        What it does: Normal assistant turn with text and tool_calls.
+        Purpose: Regression guard for the common case.
+        """
+        messages = [UnifiedMessage(role="assistant", content="Checking", tool_calls=[self.TOOL_CALL])]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assert result[0]["assistantResponseMessage"]["content"] == "Checking"
+
+    def test_merged_tool_only_assistants_stay_empty(self):
+        """
+        What it does: Two adjacent tool-only assistant messages merged by the pipeline.
+        Purpose: Merging joins contents with a newline; the result must still be empty-like.
+        """
+        merged = merge_adjacent_messages([
+            UnifiedMessage(role="assistant", content="", tool_calls=[self.TOOL_CALL]),
+            UnifiedMessage(role="assistant", content=EMPTY_CONTENT_PLACEHOLDER, tool_calls=[self.TOOL_CALL]),
+        ])
+
+        result = build_kiro_history(merged, "claude-sonnet-4")
+
+        assert result[0]["assistantResponseMessage"]["content"] == ""
+        assert len(result[0]["assistantResponseMessage"]["toolUses"]) == 2
+
+
+class TestBuildKiroPayloadToolOnlyAssistantHistory:
+    """End-to-end payload check for the placeholder leak."""
+
+    def test_payload_history_has_no_placeholder_for_tool_only_turn(self):
+        """
+        What it does: Builds a full payload for user -> tool-only assistant -> tool result.
+        Purpose: The history sent to Kiro must not contain the placeholder text.
+        """
+        tool = UnifiedTool(
+            name="Read", description="Read a file",
+            input_schema={"type": "object", "properties": {"file_path": {"type": "string"}}},
+        )
+        messages = [
+            UnifiedMessage(role="user", content="Read a.txt"),
+            UnifiedMessage(
+                role="assistant",
+                content=EMPTY_CONTENT_PLACEHOLDER,
+                tool_calls=[TestBuildKiroHistoryToolOnlyAssistant.TOOL_CALL],
+            ),
+            UnifiedMessage(
+                role="user", content="",
+                tool_results=[{"type": "tool_result", "tool_use_id": "call_1", "content": "data"}],
+            ),
+        ]
+
+        payload = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=[tool],
+            conversation_id="conv-1",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False, budget_tokens=None),
+        ).payload
+
+        history = payload["conversationState"]["history"]
+        assistant = next(h["assistantResponseMessage"] for h in history if "assistantResponseMessage" in h)
+        assert assistant["content"] == ""
+        assert assistant["toolUses"][0]["name"] == "Read"
+
+
+# ==================================================================================================
+# Tests for the empty placeholder next to toolResults (user turns)
+# ==================================================================================================
+
+class TestToolResultOnlyUserTurn:
+    """A user turn with toolResults and no text must not carry the placeholder."""
+
+    TOOL_RESULT = {"type": "tool_result", "tool_use_id": "call_1", "content": "data"}
+    TOOL_CALL = TestBuildKiroHistoryToolOnlyAssistant.TOOL_CALL
+
+    @staticmethod
+    def _tool() -> UnifiedTool:
+        """Builds a minimal tool definition."""
+        return UnifiedTool(
+            name="Read", description="Read a file",
+            input_schema={"type": "object", "properties": {"file_path": {"type": "string"}}},
+        )
+
+    def _build(self, messages, tools=True):
+        """Builds a payload with fake reasoning disabled."""
+        return build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=[self._tool()] if tools else None,
+            conversation_id="conv-1",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False, budget_tokens=None),
+        ).payload
+
+    def test_history_user_with_tool_results_keeps_empty_content(self):
+        """
+        What it does: History user turn with toolResults and empty text.
+        Purpose: The model must not read a placeholder as an empty user message.
+        """
+        messages = [UnifiedMessage(role="user", content="", tool_results=[self.TOOL_RESULT])]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        user = result[0]["userInputMessage"]
+        assert user["content"] == ""
+        assert "toolResults" in user["userInputMessageContext"]
+
+    def test_history_user_without_tool_results_keeps_placeholder(self):
+        """
+        What it does: History user turn with no text and no toolResults.
+        Purpose: Kiro rejects fully empty user content, so the placeholder stays.
+        """
+        result = build_kiro_history([UnifiedMessage(role="user", content="")], "claude-sonnet-4")
+
+        assert result[0]["userInputMessage"]["content"] == EMPTY_CONTENT_PLACEHOLDER
+
+    def test_history_user_with_text_and_tool_results_is_unchanged(self):
+        """
+        What it does: History user turn with both text and toolResults.
+        Purpose: Regression guard for the common case.
+        """
+        messages = [UnifiedMessage(role="user", content="hi", tool_results=[self.TOOL_RESULT])]
+
+        result = build_kiro_history(messages, "claude-sonnet-4")
+
+        assert result[0]["userInputMessage"]["content"] == "hi"
+
+    def test_current_message_with_tool_results_keeps_empty_content(self):
+        """
+        What it does: Last message is a tool result without text.
+        Purpose: This is the exact case where the model answered "this message is empty".
+        """
+        payload = self._build([
+            UnifiedMessage(role="user", content="Read a.txt"),
+            UnifiedMessage(role="assistant", content="", tool_calls=[self.TOOL_CALL]),
+            UnifiedMessage(role="user", content="", tool_results=[self.TOOL_RESULT]),
+        ])
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == ""
+        assert "toolResults" in current["userInputMessageContext"]
+
+    def test_current_message_without_tool_results_keeps_placeholder(self):
+        """
+        What it does: Last message is an empty user message with no toolResults.
+        Purpose: Kiro rejects empty content here, so the placeholder stays.
+        """
+        payload = self._build([
+            UnifiedMessage(role="user", content="Hello"),
+            UnifiedMessage(role="assistant", content="Hi"),
+            UnifiedMessage(role="user", content=""),
+        ], tools=False)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == EMPTY_CONTENT_PLACEHOLDER
+
+    def test_current_assistant_last_message_gets_placeholder_user(self):
+        """
+        What it does: Conversation ends with an assistant message.
+        Purpose: A synthetic user turn is required and keeps the placeholder.
+        """
+        payload = self._build([
+            UnifiedMessage(role="user", content="Hello"),
+            UnifiedMessage(role="assistant", content="Hi"),
+        ], tools=False)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == EMPTY_CONTENT_PLACEHOLDER
+
+    def test_current_message_with_images_only_keeps_placeholder(self):
+        """
+        What it does: Last message has an image and no text.
+        Purpose: Only toolResults waive the placeholder, images do not.
+        """
+        payload = self._build([
+            UnifiedMessage(role="user", content="Hello"),
+            UnifiedMessage(role="assistant", content="Hi"),
+            UnifiedMessage(
+                role="user", content="",
+                images=[{"media_type": "image/jpeg", "data": TEST_IMAGE_BASE64}],
+            ),
+        ], tools=False)
+
+        current = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == EMPTY_CONTENT_PLACEHOLDER

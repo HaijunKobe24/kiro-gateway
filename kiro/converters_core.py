@@ -48,6 +48,39 @@ from kiro.model_request_fields import ADDITIONAL_FIELDS_KEY
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
 
+# Placeholder text sent to Kiro where its API requires non-empty content.
+EMPTY_CONTENT_PLACEHOLDER = "(empty placeholder)"
+
+
+def strip_leaked_placeholder(text: str) -> str:
+    """
+    Removes lines that consist solely of the empty-content placeholder.
+
+    When assistant history entries carry the placeholder as text, the model learns
+    to imitate it and emits the placeholder as visible output. Clients then store
+    that output and send it back, which reinforces the pattern. Stripping such
+    lines from assistant history breaks the feedback loop.
+
+    Only whole lines equal to the placeholder are removed, so text that merely
+    mentions the placeholder is preserved.
+
+    Args:
+        text: Assistant text content
+
+    Returns:
+        Text without placeholder-only lines, stripped of surrounding whitespace
+        when anything was removed; the original text otherwise
+    """
+    if EMPTY_CONTENT_PLACEHOLDER not in text:
+        return text
+
+    lines = text.split("\n")
+    kept = [line for line in lines if line.strip() != EMPTY_CONTENT_PLACEHOLDER]
+    if len(kept) == len(lines):
+        return text
+    return "\n".join(kept).strip()
+
+
 # ==================================================================================================
 # Data Classes for Unified Message Format
 # ==================================================================================================
@@ -1347,10 +1380,6 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
         if msg.role == "user":
             content = extract_text_content(msg.content)
             
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
-            
             user_input = {
                 "content": content,
                 "origin": "AI_EDITOR",
@@ -1383,19 +1412,26 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             if user_input_context:
                 user_input["userInputMessageContext"] = user_input_context
             
+            # Kiro API requires non-empty content, but a turn carrying toolResults is
+            # valid without text. A placeholder there is read by the model as a user
+            # message saying nothing ("this message is empty, what do you want?").
+            if not content and "toolResults" not in user_input_context:
+                user_input["content"] = EMPTY_CONTENT_PLACEHOLDER
+            
             history.append({"userInputMessage": user_input})
             
         elif msg.role == "assistant":
-            content = extract_text_content(msg.content)
+            content = strip_leaked_placeholder(extract_text_content(msg.content))
+            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
+            # Kiro API requires non-empty content, but only for turns without toolUses.
+            # An assistant turn that only calls tools is sent with empty content: a
+            # placeholder here makes the model echo it back as visible output.
+            if not content and not tool_uses:
+                content = EMPTY_CONTENT_PLACEHOLDER
             
             assistant_response = {"content": content}
             
-            # Process tool_calls
-            tool_uses = extract_tool_uses_from_message(msg.content, msg.tool_calls)
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
             
@@ -1517,11 +1553,7 @@ def build_kiro_payload(
                 "content": current_content
             }
         })
-        current_content = "(empty placeholder)"
-    
-    # If content is empty - use placeholder
-    if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
@@ -1552,6 +1584,11 @@ def build_kiro_payload(
         tool_results = extract_tool_results_from_content(current_message.content)
         if tool_results:
             user_input_context["toolResults"] = tool_results
+    
+    # Kiro API requires non-empty content, except when toolResults are attached.
+    # A placeholder next to toolResults is read by the model as an empty user message.
+    if not current_content and "toolResults" not in user_input_context:
+        current_content = EMPTY_CONTENT_PLACEHOLDER
     
     # Inject thinking tags if enabled (only for the current/last user message)
     if current_message.role == "user":
