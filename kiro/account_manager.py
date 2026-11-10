@@ -507,7 +507,7 @@ class AccountManager:
                 # Old endpoint - attempt to fetch dynamic model list
                 # Fetch models list with retry + fallback
                 params = {"origin": "AI_EDITOR"}
-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                if auth_manager.profile_arn:
                     params["profileArn"] = auth_manager.profile_arn
                 
                 list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
@@ -605,7 +605,7 @@ class AccountManager:
         
         try:
             params = {"origin": "AI_EDITOR"}
-            if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
+            if account.auth_manager.profile_arn:
                 params["profileArn"] = account.auth_manager.profile_arn
             
             list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"

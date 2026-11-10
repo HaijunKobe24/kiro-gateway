@@ -731,6 +731,16 @@ ACCOUNT_CACHE_TTL: int = int(os.getenv("ACCOUNT_CACHE_TTL", "43200"))
 STATE_SAVE_INTERVAL_SECONDS: int = int(os.getenv("STATE_SAVE_INTERVAL_SECONDS", "10"))
 
 # ==================================================================================================
+# Kiro IDE Client Version (sent in User-Agent)
+# ==================================================================================================
+
+# Kiro API rejects outdated client versions with HTTP 403
+# ("This version of Kiro is no longer supported", reason FEATURE_NOT_SUPPORTED).
+# Set this to a currently supported Kiro IDE version (see Kiro IDE -> About)
+# if requests start failing with that error.
+KIRO_IDE_VERSION: str = os.getenv("KIRO_IDE_VERSION", "1.4.62")
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 
