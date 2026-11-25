@@ -1431,3 +1431,65 @@ class TestFakeReasoningConfig:
 
         assert "# FAKE_REASONING=true" in text
         assert "Default: false (DISABLED)" in text
+
+
+class TestUpstreamDropRetryConfig:
+    """Tests for the UPSTREAM_DROP_RETRY switch."""
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self, monkeypatch):
+        """Reloads kiro.config with the real environment after each test."""
+        yield
+        monkeypatch.undo()
+        from importlib import reload
+        import kiro.config as config_module
+        reload(config_module)
+
+    @staticmethod
+    def _reload(monkeypatch, value):
+        """Reloads kiro.config with UPSTREAM_DROP_RETRY set (None removes it)."""
+        from importlib import reload
+        import kiro.config as config_module
+        if value is None:
+            monkeypatch.delenv("UPSTREAM_DROP_RETRY", raising=False)
+        else:
+            monkeypatch.setenv("UPSTREAM_DROP_RETRY", value)
+        return reload(config_module)
+
+    def test_default_is_on(self, monkeypatch):
+        """
+        What it does: Removes the variable and reloads the config.
+        Purpose: The retry is enabled by default.
+        """
+        assert self._reload(monkeypatch, None).UPSTREAM_DROP_RETRY is True
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", " true "])
+    def test_truthy_values_enable(self, monkeypatch, raw):
+        """
+        What it does: Each accepted truthy spelling.
+        Purpose: Same parsing as the other switches.
+        """
+        assert self._reload(monkeypatch, raw).UPSTREAM_DROP_RETRY is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no", "off", "", " false "])
+    def test_falsy_values_disable(self, monkeypatch, raw):
+        """
+        What it does: Each accepted falsy spelling.
+        Purpose: Users can restore the old behavior.
+        """
+        assert self._reload(monkeypatch, raw).UPSTREAM_DROP_RETRY is False
+
+    def test_typo_disables_with_warning(self, monkeypatch):
+        """
+        What it does: A misspelled value ("ture").
+        Purpose: Disabled, and the shared parser logs a WARNING that names the variable.
+        """
+        from loguru import logger
+        warnings = []
+        handler_id = logger.add(lambda m: warnings.append(str(m)), level="WARNING", format="{message}")
+        try:
+            module = self._reload(monkeypatch, "ture")
+        finally:
+            logger.remove(handler_id)
+        assert module.UPSTREAM_DROP_RETRY is False
+        assert any("UPSTREAM_DROP_RETRY" in w for w in warnings)

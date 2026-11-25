@@ -47,9 +47,17 @@ from kiro.streaming_core import (
     StreamReadyMarker,
     calculate_tokens_from_context_usage,
     check_stream_outcome,
+    log_response_summary,
+    is_upstream_drop,
     stream_with_first_token_retry,
+    wrap_recoverable,
 )
-from kiro.empty_response import build_incomplete_stream_error_anthropic, log_incomplete_stream
+from kiro.empty_response import (
+    build_incomplete_stream_error_anthropic,
+    build_stream_interrupted_error_anthropic,
+    log_incomplete_stream,
+)
+from kiro.stream_recovery import RecoverySettings, UpstreamStreamInterrupted
 from kiro.upstream_guard import StreamOutcome
 from kiro.tokenizer import count_tokens, estimate_request_tokens
 from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
@@ -58,6 +66,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_HANDLING,
     FAKE_REASONING_AS_TEXT_MODES,
+    UPSTREAM_DROP_RETRY,
 )
 
 if TYPE_CHECKING:
@@ -92,6 +101,22 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
         Formatted SSE string
     """
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def is_message_start_chunk(chunk: str) -> bool:
+    """
+    Tell whether an SSE chunk is the Anthropic message_start event.
+
+    message_start carries no model output, so it does not prevent a retry of a stream
+    that the upstream dropped before any content block was sent.
+
+    Args:
+        chunk: SSE chunk produced by format_sse_event
+
+    Returns:
+        True when the chunk starts with "event: message_start"
+    """
+    return chunk.startswith("event: message_start")
 
 
 def generate_thinking_signature() -> str:
@@ -692,7 +717,17 @@ async def stream_kiro_to_anthropic(
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
-        
+        # Fingerprint of what is sent to the client (sizes only, never content)
+        log_response_summary(
+            api="anthropic",
+            model=model,
+            finish_reason=stop_reason,
+            text_chars=len(full_content),
+            reasoning_chars=len(full_thinking_content),
+            tool_names=[str(block.get("name", "")) for block in tool_blocks],
+            truncated_tools=len(truncated_tools),
+            metering_seen=outcome.scanner.saw_metering,
+        )
         # Send message_delta with stop_reason and usage
         usage_payload = {
             "output_tokens": output_tokens
@@ -753,6 +788,31 @@ async def stream_kiro_to_anthropic(
         error_msg = str(e) if str(e) else "(empty message)"
         logger.error(f"Error during Anthropic streaming: [{error_type}] {error_msg}", exc_info=True)
         
+        # A dropped upstream connection before any content block was started can still be
+        # retried (see stream_with_first_token_retry): the client has only seen message_start,
+        # so do not send an error event that would end its stream. If the retry is not
+        # possible, the route sends the error event for the exception.
+        output_started = (
+            current_block_index > 0 or thinking_block_started or text_block_started or bool(tool_blocks)
+        )
+        if isinstance(e, UpstreamStreamInterrupted):
+            # The recovery session gave up: close the open block in order and end the stream
+            # with an explicit error event
+            logger.error(f"[StreamRecovery] stream ended with an error event: reason={e.reason}")
+            if thinking_block_started and thinking_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": thinking_block_index
+                })
+            if text_block_started and text_block_index is not None:
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": text_block_index
+                })
+            yield build_stream_interrupted_error_anthropic()
+            return
+        if UPSTREAM_DROP_RETRY and is_upstream_drop(e) and not output_started:
+            raise
         # Send error event
         yield format_sse_event("error", {
             "type": "error",
@@ -776,7 +836,8 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    recovery: Optional[RecoverySettings] = None,
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -791,6 +852,8 @@ async def collect_anthropic_response(
         request_messages: Original request messages (for token counting)
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
+        recovery: Optional mid-stream drop recovery settings. Nothing was sent to the
+            client yet, so a recovered drop is invisible in the returned response.
     
     Returns:
         Dictionary with full response in Anthropic Messages format
@@ -798,6 +861,7 @@ async def collect_anthropic_response(
     Raises:
         EmptyUpstreamResponseError: The upstream response was empty, or incomplete
             (reasoning only, no meteringEvent, no text, no tool_use)
+        UpstreamStreamInterrupted: A mid-stream drop could not be recovered
     """
     message_id = generate_message_id()
     
@@ -813,7 +877,7 @@ async def collect_anthropic_response(
         input_tokens = request_token_stats["total_tokens"]
     
     # Collect stream result
-    result = await collect_stream_to_result(response)
+    result = await collect_stream_to_result(response, recovery=recovery)
     upstream_cache_usage = _extract_cache_usage_fields(result.usage)
     
     # Build content blocks
@@ -893,7 +957,20 @@ async def collect_anthropic_response(
         stop_reason = "tool_use"
     else:
         stop_reason = "end_turn"
-    
+    # Fingerprint of what is sent to the client (sizes only, never content)
+    log_response_summary(
+        api="anthropic",
+        model=model,
+        finish_reason=stop_reason,
+        text_chars=len(result.content),
+        reasoning_chars=len(result.thinking_content),
+        tool_names=[
+            str((tc.get("function") or {}).get("name") or tc.get("name") or "")
+            for tc in result.tool_calls
+        ],
+        truncated_tools=sum(1 for tc in result.tool_calls if tc.get("_truncation_detected")),
+        metering_seen=result.usage is not None,
+    )
     logger.debug(
         f"[Anthropic Non-Streaming] Completed: "
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
@@ -929,7 +1006,8 @@ async def stream_with_first_token_retry_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    emit_ready_marker: bool = False
+    emit_ready_marker: bool = False,
+    recovery: Optional[RecoverySettings] = None,
 ) -> AsyncGenerator[Union[str, StreamReadyMarker], None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -954,6 +1032,9 @@ async def stream_with_first_token_retry_anthropic(
         request_system: Original system prompt (for fallback token counting)
         emit_ready_marker: Yield STREAM_READY once the upstream response was accepted
             (see streaming_core.prime_sse_stream)
+        recovery: Optional mid-stream drop recovery settings. When given (and
+            UPSTREAM_DROP_RETRY is on), every accepted response is wrapped in a recovery
+            session, so a dropped stream is continued inside the same SSE response.
     
     Yields:
         Strings in Anthropic SSE format, preceded by STREAM_READY when requested
@@ -991,7 +1072,7 @@ async def stream_with_first_token_retry_anthropic(
         """Process response and yield Anthropic SSE chunks."""
         nonlocal message_started
         async for chunk in stream_kiro_to_anthropic(
-            response,
+            wrap_recoverable(response, recovery),
             model,
             model_cache,
             auth_manager,
@@ -1013,5 +1094,6 @@ async def stream_with_first_token_retry_anthropic(
         on_http_error=create_http_error,
         on_all_retries_failed=create_timeout_error,
         emit_ready_marker=emit_ready_marker,
+        is_preamble_chunk=is_message_start_chunk,
     ):
         yield chunk

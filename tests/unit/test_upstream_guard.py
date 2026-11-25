@@ -9,6 +9,7 @@ EmptyUpstreamResponseError. All bytes are real AWS event-stream frames built by 
 aws_frames fixture; nothing touches the network.
 """
 
+import asyncio
 from typing import AsyncGenerator, List
 from unittest.mock import AsyncMock, MagicMock
 
@@ -510,6 +511,84 @@ class TestGuardedResponse:
         response.aclose.assert_awaited_once()
 
 
+class TestGuardedResponseReadCounters:
+    """bytes_read / chunks_read / last_chunk_at, used for [StreamDrop] diagnostics."""
+
+    def test_counters_start_at_zero(self):
+        """
+        What it does: Creates a wrapper without reading anything.
+        Purpose: No chunk was read, so idle time cannot be computed (last_chunk_at is None).
+        """
+        guarded = GuardedResponse(MagicMock(), None, [])
+        assert guarded.bytes_read == 0
+        assert guarded.chunks_read == 0
+        assert guarded.last_chunk_at is None
+        assert guarded.created_at > 0
+
+    @pytest.mark.asyncio
+    async def test_counts_peeked_and_streamed_chunks(self):
+        """
+        What it does: Peeks two chunks, reads all four through aiter_bytes().
+        Purpose: Peeked bytes are counted too: the counters describe the whole upstream body.
+        """
+        chunks = [b"aa", b"bbb", b"c", b"dddd"]
+        response = make_httpx_like_response(chunks)
+        iterator = response.aiter_bytes()
+        peeked = [await iterator.__anext__(), await iterator.__anext__()]
+        guarded = GuardedResponse(response, iterator, peeked)
+        _ = [chunk async for chunk in guarded.aiter_bytes()]
+        assert guarded.bytes_read == 10
+        assert guarded.chunks_read == 4
+        assert guarded.last_chunk_at is not None
+
+    @pytest.mark.asyncio
+    async def test_counters_are_exact_when_the_stream_breaks(self):
+        """
+        What it does: The upstream iterator raises after two chunks.
+        Purpose: At the moment of the drop the counters show what really arrived.
+        """
+        async def broken() -> AsyncGenerator[bytes, None]:
+            yield b"12345"
+            yield b"678"
+            raise httpx.RemoteProtocolError("peer closed connection")
+        guarded = GuardedResponse(MagicMock(), broken(), [])
+        with pytest.raises(httpx.RemoteProtocolError):
+            async for _ in guarded.aiter_bytes():
+                pass
+        assert guarded.bytes_read == 8
+        assert guarded.chunks_read == 2
+
+    @pytest.mark.asyncio
+    async def test_last_chunk_time_moves_forward(self):
+        """
+        What it does: Reads two chunks and compares last_chunk_at after each.
+        Purpose: Idle time is measured from the most recent chunk, not from the first.
+        """
+        async def slow() -> AsyncGenerator[bytes, None]:
+            yield b"a"
+            await asyncio.sleep(0.02)
+            yield b"b"
+        guarded = GuardedResponse(MagicMock(), slow(), [])
+        stamps = []
+        async for _ in guarded.aiter_bytes():
+            stamps.append(guarded.last_chunk_at)
+        assert stamps[1] > stamps[0]
+
+    @pytest.mark.asyncio
+    async def test_empty_chunks_are_counted_without_adding_bytes(self):
+        """
+        What it does: Reads an empty bytes chunk.
+        Purpose: Boundary: zero-length chunks count as chunks, not as bytes.
+        """
+        async def gen() -> AsyncGenerator[bytes, None]:
+            yield b""
+            yield b"x"
+        guarded = GuardedResponse(MagicMock(), gen(), [])
+        _ = [chunk async for chunk in guarded.aiter_bytes()]
+        assert guarded.bytes_read == 1
+        assert guarded.chunks_read == 2
+
+
 class TestEmptyUpstreamResponseError:
     """Error attributes and message."""
 
@@ -846,3 +925,111 @@ class TestExceptionFrames:
         """
         assert scan([aws_frames.reasoning("r")]).saw_metering is False
         assert scan([aws_frames.reasoning("r"), aws_frames.metering(1.0)]).saw_metering is True
+
+
+class TestGuardedResponseMaxGap:
+    """max_gap_s: longest wait between two upstream chunks."""
+
+    @pytest.mark.asyncio
+    async def test_max_gap_measures_the_longest_wait(self):
+        """
+        What it does: Two chunks 0.05s apart, then one after 0.01s.
+        Purpose: The longest pause is reported, not the last or the first one.
+        """
+        async def gen() -> AsyncGenerator[bytes, None]:
+            yield b"a"
+            await asyncio.sleep(0.05)
+            yield b"b"
+            await asyncio.sleep(0.01)
+            yield b"c"
+        guarded = GuardedResponse(MagicMock(), gen(), [])
+        _ = [chunk async for chunk in guarded.aiter_bytes()]
+        assert 0.04 <= guarded.max_gap_s < 0.5
+
+    @pytest.mark.asyncio
+    async def test_peeked_chunks_replayed_at_once_are_not_a_gap(self):
+        """
+        What it does: Replays peeked chunks immediately after creation.
+        Purpose: Replayed bytes must not hide or fake a pause.
+        """
+        guarded = GuardedResponse(MagicMock(), None, [b"x", b"y"])
+
+        async def nothing() -> AsyncGenerator[bytes, None]:
+            return
+            yield b""
+        guarded._iterator = nothing()
+        _ = [chunk async for chunk in guarded.aiter_bytes()]
+        assert guarded.max_gap_s < 0.05
+
+    def test_max_gap_starts_at_zero(self):
+        """
+        What it does: No chunk read.
+        Purpose: Boundary: no gap before anything was read.
+        """
+        assert GuardedResponse(MagicMock(), None, []).max_gap_s == 0.0
+
+
+# =============================================================================
+# UpstreamFrameScanner.reset_tail (one scanner across several upstream attempts)
+# =============================================================================
+
+class TestScannerResetTail:
+    """reset_tail drops the carried bytes but keeps the counters."""
+
+    def test_counters_survive_reset_tail(self, aws_frames):
+        """
+        What it does: Feeds a frame, resets the tail, feeds another frame.
+        Goal: Both frames are counted, bytes_received adds up.
+        """
+        first = aws_frames.content("a")
+        second = aws_frames.metering(0.1)
+        scanner = UpstreamFrameScanner()
+        scanner.feed(first)
+        scanner.reset_tail()
+        scanner.feed(second)
+        assert scanner.counts["assistantResponseEvent"] == 1
+        assert scanner.counts["meteringEvent"] == 1
+        assert scanner.bytes_received == len(first) + len(second)
+
+    def test_truncated_frame_is_not_joined_with_the_next_attempt(self, aws_frames):
+        """
+        What it does: Attempt 1 ends in the middle of a frame header; attempt 2 starts with a new
+        frame. The scanner is reset between them.
+        Goal: The truncated header is never completed by the bytes of attempt 2 (no spurious count).
+        """
+        frame = aws_frames.content("hello")
+        cut = frame.index(b"assistantResponseEvent") + 5
+        truncated = frame[:cut]
+        remainder = frame[cut:]
+
+        joined = UpstreamFrameScanner()
+        joined.feed(truncated)
+        joined.feed(remainder)
+        assert joined.counts["assistantResponseEvent"] == 1
+
+        separated = UpstreamFrameScanner()
+        separated.feed(truncated)
+        separated.reset_tail()
+        separated.feed(remainder)
+        assert separated.counts["assistantResponseEvent"] == 0
+
+    def test_reset_tail_on_fresh_scanner_is_harmless(self, aws_frames):
+        """
+        What it does: reset_tail before any feed.
+        Goal: Scanning works normally afterwards.
+        """
+        scanner = UpstreamFrameScanner()
+        scanner.reset_tail()
+        scanner.feed(aws_frames.metering(0.1))
+        assert scanner.saw_metering is True
+
+    def test_frames_fully_inside_old_tail_are_not_recounted(self, aws_frames):
+        """
+        What it does: Feeds a full frame, resets, feeds a new full frame.
+        Goal: Counts are exact (1 + 1), nothing is double counted from the old tail.
+        """
+        scanner = UpstreamFrameScanner()
+        scanner.feed(aws_frames.content("a"))
+        scanner.reset_tail()
+        scanner.feed(aws_frames.content("b"))
+        assert scanner.counts["assistantResponseEvent"] == 2

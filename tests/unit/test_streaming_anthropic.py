@@ -23,6 +23,7 @@ from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
     stream_with_first_token_retry_anthropic,
+    is_message_start_chunk,
 )
 from kiro.streaming_core import KiroEvent, StreamResult
 
@@ -2889,3 +2890,802 @@ class TestCollectAnthropicResponseIncomplete:
 
         assert [b["type"] for b in result["content"]] == ["thinking"]
         assert result["stop_reason"] == "end_turn"
+
+
+# ==================================================================================================
+# Upstream connection drop: retry before any content block, error event after
+# ==================================================================================================
+
+DROP_TEXT = "peer closed connection without sending complete message body (incomplete chunked read)"
+
+
+def _dropping_stream_response(chunks):
+    """Response double whose stream yields chunks and then raises the upstream drop error."""
+    response = AsyncMock()
+    response.status_code = 200
+    response.aclose = AsyncMock()
+
+    async def gen():
+        for chunk in chunks:
+            yield chunk
+        raise httpx.RemoteProtocolError(DROP_TEXT)
+
+    response.aiter_bytes = lambda *a, **k: gen()
+    return response
+
+
+class TestIsMessageStartChunk:
+    """Tests for is_message_start_chunk()."""
+
+    def test_recognises_message_start(self):
+        """
+        What it does: Checks a real format_sse_event("message_start") chunk.
+        Purpose: This is the preamble that must not block a retry.
+        """
+        assert is_message_start_chunk(format_sse_event("message_start", {"type": "message_start"})) is True
+
+    @pytest.mark.parametrize("event", ["content_block_start", "content_block_delta", "ping", "error", "message_stop"])
+    def test_other_events_are_not_preamble(self, event):
+        """
+        What it does: Checks other event types.
+        Purpose: Anything else counts as client-visible output.
+        """
+        assert is_message_start_chunk(format_sse_event(event, {"type": event})) is False
+
+    def test_empty_chunk_is_not_preamble(self):
+        """
+        What it does: Empty string.
+        Purpose: Boundary: no crash, not a message_start.
+        """
+        assert is_message_start_chunk("") is False
+
+
+class TestStreamingAnthropicUpstreamDrop:
+    """stream_with_first_token_retry_anthropic(): connection drops."""
+
+    @staticmethod
+    async def _run(response, make_request=None, max_retries=3):
+        """Runs the Anthropic wrapper; returns (items, raised exception or None)."""
+        cache = MagicMock()
+        cache.get_max_input_tokens.return_value = 200000
+        items = []
+        raised = None
+        try:
+            async for item in stream_with_first_token_retry_anthropic(
+                make_request=make_request or AsyncMock(),
+                model="claude-sonnet-4.5",
+                model_cache=cache,
+                auth_manager=MagicMock(),
+                initial_response=response,
+                first_token_timeout=5,
+                max_retries=max_retries,
+                emit_ready_marker=True,
+            ):
+                items.append(item)
+        except Exception as e:
+            raised = e
+        return items, raised
+
+    @pytest.mark.asyncio
+    async def test_drop_before_any_bytes_is_retried(self, aws_frames, anthropic_sse):
+        """
+        What it does: Attempt 1 drops in the guard peek; attempt 2 is a normal stream.
+        Purpose: Legal sequence with one message_start and no error event.
+        """
+        good = _real_stream_response([_normal_bytes(aws_frames)])
+        make_request = AsyncMock(return_value=good)
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+            items, raised = await self._run(_dropping_stream_response([]), make_request)
+        assert raised is None
+        assert items[0] is STREAM_READY
+        events = anthropic_sse.parse(items[1:])
+        assert [n for n, _ in events].count("message_start") == 1
+        assert "error" not in [n for n, _ in events]
+        assert anthropic_sse.assert_legal(events) == ["thinking", "text"]
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_after_only_neutral_frames_is_retried(self, aws_frames, anthropic_sse):
+        """
+        What it does: Attempt 1 delivers only a contextUsageEvent frame, then drops.
+        Purpose: Neutral frames carry no output, so the client has seen nothing yet.
+        """
+        good = _real_stream_response([_normal_bytes(aws_frames)])
+        make_request = AsyncMock(return_value=good)
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+            items, raised = await self._run(
+                _dropping_stream_response([aws_frames.context_usage(3.0)]), make_request
+            )
+        assert raised is None
+        events = anthropic_sse.parse(items[1:])
+        anthropic_sse.assert_legal(events)
+        assert [n for n, _ in events].count("message_start") == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_after_message_start_does_not_repeat_it(self, aws_frames, anthropic_sse):
+        """
+        What it does: Guard off, so message_start is sent before the first read fails.
+        Purpose: Attempt 2 must not send a second message_start, and the dropped attempt
+        must not send an error event that would end the stream.
+        """
+        good = _real_stream_response([_normal_bytes(aws_frames)])
+        make_request = AsyncMock(return_value=good)
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            items, raised = await self._run(_dropping_stream_response([]), make_request)
+        assert raised is None
+        events = anthropic_sse.parse([i for i in items if isinstance(i, str)])
+        names = [n for n, _ in events]
+        assert names.count("message_start") == 1
+        assert "error" not in names
+        anthropic_sse.assert_legal(events)
+
+    @pytest.mark.asyncio
+    async def test_drop_after_text_is_not_retried_and_sends_error_event(self, aws_frames, anthropic_sse):
+        """
+        What it does: Attempt 1 streams a text block, then the connection drops.
+        Purpose: A retry would append a second answer. The client gets the text once and
+        an error event; the drop error still propagates; no new request is made.
+        """
+        make_request = AsyncMock()
+        response = _dropping_stream_response([aws_frames.content("Hello")])
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+            items, raised = await self._run(response, make_request)
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        make_request.assert_not_awaited()
+        strings = [i for i in items if isinstance(i, str)]
+        events = anthropic_sse.parse(strings)
+        names = [n for n, _ in events]
+        assert names.count("message_start") == 1
+        assert names[-1] == "error"
+        text = "".join(
+            d["delta"].get("text", "") for n, d in events if n == "content_block_delta"
+        )
+        assert text == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_drop_after_reasoning_only_is_not_retried(self, aws_frames, anthropic_sse):
+        """
+        What it does: Attempt 1 streams a thinking block, then drops.
+        Purpose: Reasoning is client-visible output too.
+        """
+        make_request = AsyncMock()
+        response = _dropping_stream_response([aws_frames.reasoning("thinking...")])
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+            items, raised = await self._run(response, make_request)
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        make_request.assert_not_awaited()
+        names = [n for n, _ in anthropic_sse.parse([i for i in items if isinstance(i, str)])]
+        assert "content_block_start" in names
+        assert names[-1] == "error"
+
+    @pytest.mark.asyncio
+    async def test_all_attempts_dropping_ends_without_error_event_in_stream(self, aws_frames, anthropic_sse):
+        """
+        What it does: Every attempt drops before output; budget 3.
+        Purpose: The drop error propagates (the route sends the error event once); the
+        wrapper itself emitted a single message_start and no error event.
+        """
+        responses = [_dropping_stream_response([]), _dropping_stream_response([])]
+        make_request = AsyncMock(side_effect=lambda: responses.pop(0))
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            items, raised = await self._run(_dropping_stream_response([]), make_request, max_retries=3)
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        assert make_request.await_count == 2
+        names = [n for n, _ in anthropic_sse.parse([i for i in items if isinstance(i, str)])]
+        assert names == ["message_start"]
+
+    @pytest.mark.asyncio
+    async def test_switch_off_keeps_old_behavior(self, aws_frames, anthropic_sse):
+        """
+        What it does: UPSTREAM_DROP_RETRY=False and a drop before output.
+        Purpose: Old behavior: message_start, an error event, no retry.
+        """
+        make_request = AsyncMock()
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False), \
+                patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False), \
+                patch("kiro.streaming_anthropic.UPSTREAM_DROP_RETRY", False):
+            items, raised = await self._run(_dropping_stream_response([]), make_request)
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        make_request.assert_not_awaited()
+        names = [n for n, _ in anthropic_sse.parse([i for i in items if isinstance(i, str)])]
+        assert names == ["message_start", "error"]
+
+
+# ==================================================================================================
+# Mid-stream drop recovery (Kiro IDE parity): recovery session behind the Anthropic formatter
+# ==================================================================================================
+
+from kiro.stream_recovery import (  # noqa: E402
+    CONNECTION_INTERRUPTED_MESSAGE,
+    CONTINUE_PROMPT,
+    INTERRUPTED_TOOL_RESULT_MESSAGE,
+    RecoverySettings,
+    UpstreamStreamInterrupted,
+)
+
+
+def _scripted_response(chunks):
+    """Response double whose one-shot byte stream yields bytes and raises listed exceptions."""
+    response = AsyncMock()
+    response.status_code = 200
+    response.aclose = AsyncMock()
+
+    async def gen():
+        for chunk in chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            yield chunk
+
+    response.aiter_bytes = lambda *a, **k: gen()
+    return response
+
+
+def _drop():
+    """The exception httpx raises when the upstream closes a chunked body early."""
+    return httpx.RemoteProtocolError(DROP_TEXT)
+
+
+def _recovery_payload():
+    """Minimal Kiro payload with one tool and a current user message."""
+    return {
+        "profileArn": "arn:test",
+        "conversationState": {
+            "conversationId": "conv-1",
+            "history": [],
+            "currentMessage": {"userInputMessage": {
+                "content": "write the file",
+                "modelId": "claude-haiku-5.5",
+                "origin": "AI_EDITOR",
+                "userInputMessageContext": {"tools": [{"toolSpecification": {"name": "Write"}}]},
+            }},
+        },
+    }
+
+
+def _tool_bytes(aws_frames, tool_id, name="Write", args='{"path": "/a", "content": "x"}'):
+    """Frames of one complete tool call."""
+    return [
+        aws_frames.tool_start(name, tool_id),
+        aws_frames.tool_input(args, name, tool_id),
+        aws_frames.tool_stop(name, tool_id),
+    ]
+
+
+def _half_tool(aws_frames, tool_id="t1"):
+    """Frames of a tool call that is still streaming (no stop frame)."""
+    return [
+        aws_frames.tool_start("Write", tool_id),
+        aws_frames.tool_input('{"path": "/a", "content": "par', "Write", tool_id),
+    ]
+
+
+@pytest.fixture
+def recovery_env():
+    """Recovery on, guard on, native reasoning as thinking blocks, backoff sleep patched (yielded)."""
+    sleep = AsyncMock()
+    with _patch_handling("as_reasoning_content", enabled=False), \
+            patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", True), \
+            patch("kiro.streaming_anthropic.UPSTREAM_DROP_RETRY", True), \
+            patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True), \
+            patch("kiro.streaming_core.backoff_sleep", sleep):
+        yield sleep
+
+
+def _recovery(*later):
+    """RecoverySettings whose make_request serves the scripted later attempts in order."""
+    make_request = AsyncMock(side_effect=[_scripted_response(chunks) for chunks in later])
+    return RecoverySettings(payload=_recovery_payload(), make_request=make_request, max_attempts=3)
+
+
+async def _anthropic_with_recovery(first, recovery):
+    """Runs the Anthropic wrapper over a scripted first attempt; returns (SSE strings, raised)."""
+    cache = MagicMock()
+    cache.get_max_input_tokens.return_value = 200000
+    items = []
+    raised = None
+    try:
+        async for item in stream_with_first_token_retry_anthropic(
+            make_request=AsyncMock(),
+            model="claude-haiku-5.5",
+            model_cache=cache,
+            auth_manager=MagicMock(),
+            initial_response=_scripted_response(first),
+            first_token_timeout=5,
+            max_retries=3,
+            emit_ready_marker=True,
+            recovery=recovery,
+        ):
+            items.append(item)
+    except Exception as e:  # noqa: BLE001 - the test inspects the exception
+        raised = e
+    return [i for i in items if isinstance(i, str)], raised
+
+
+def _text_of(events):
+    """Concatenated text_delta text of parsed SSE events."""
+    return "".join(
+        d["delta"].get("text", "") for n, d in events
+        if n == "content_block_delta" and d["delta"]["type"] == "text_delta"
+    )
+
+
+def _tool_ids(events):
+    """Ids of the tool_use blocks of parsed SSE events."""
+    return [
+        d["content_block"]["id"] for n, d in events
+        if n == "content_block_start" and d["content_block"]["type"] == "tool_use"
+    ]
+
+
+class TestStreamingAnthropicRecovery:
+    """stream_with_first_token_retry_anthropic(recovery=...): one logical message across drops."""
+
+    @pytest.mark.asyncio
+    async def test_rule2_drop_mid_tool_after_text_is_continued(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: Thinking, text, a half tool call, a drop; the continuation re-issues the tool.
+        Purpose: One legal message: one message_start, blocks thinking/text/tool_use with indices
+        0, 1, 2, the new tool id, stop_reason tool_use, one message_stop; second request has the
+        failed tool result.
+        """
+        recovery = _recovery(_tool_bytes(aws_frames, "t2") + [aws_frames.metering(0.5)])
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.reasoning("hmm"), aws_frames.content("Let me write it.")]
+            + _half_tool(aws_frames) + [_drop()],
+            recovery,
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["thinking", "text", "tool_use"]
+        assert _text_of(events) == "Let me write it."
+        assert _tool_ids(events) == ["t2"]
+        assert [d for n, d in events if n == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+        assert [n for n, _ in events].count("message_stop") == 1
+        recovery.make_request.assert_awaited_once()
+        sent = recovery.make_request.await_args.args[0]
+        assert sent["conversationState"]["history"][-1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"] == "t1"
+        result = sent["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["toolResults"][0]
+        assert result["content"] == [{"text": INTERRUPTED_TOOL_RESULT_MESSAGE}]
+        recovery_env.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rule2_tool_only_drop_continues_with_text_and_tool(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: No output before the drop; the continuation produces text and a tool.
+        Purpose: A single message_start (sent before the drop) and legal indices from 0.
+        """
+        recovery = _recovery(
+            [aws_frames.content("Retrying.")] + _tool_bytes(aws_frames, "t2") + [aws_frames.metering(0.1)]
+        )
+        items, raised = await _anthropic_with_recovery(_half_tool(aws_frames) + [_drop()], recovery)
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["text", "tool_use"]
+        assert [n for n, _ in events].count("message_start") == 1
+
+    @pytest.mark.asyncio
+    async def test_rule3_drop_before_output_resends(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: An unknown (non-neutral) frame, then a drop: no content block was sent.
+        Purpose: The unchanged request is resent; one message_start, no error event.
+        """
+        recovery = _recovery([aws_frames.content("Hello"), aws_frames.metering(0.1)])
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.build("unknownEvent", {"x": 1}), _drop()], recovery
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["text"]
+        assert _text_of(events) == "Hello"
+        assert recovery.make_request.await_args.args[0] is recovery.payload
+
+    @pytest.mark.asyncio
+    async def test_rule4_drop_after_text_resends_once_and_forwards_as_is(
+        self, aws_frames, anthropic_sse, recovery_env
+    ):
+        """
+        What it does: "The answer is", a drop, then "The answer is 42.".
+        Purpose: Both outputs appear in one text block (as is, like Kiro); the request holds the
+        continue prompt.
+        """
+        recovery = _recovery([aws_frames.content("The answer is 42."), aws_frames.metering(0.1)])
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.content("The answer is"), _drop()], recovery
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["text"]
+        assert _text_of(events) == "The answer isThe answer is 42."
+        sent = recovery.make_request.await_args.args[0]
+        assert sent["conversationState"]["currentMessage"]["userInputMessage"]["content"] == CONTINUE_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_rule5_reasoning_only_ends_with_an_error_event(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: Reasoning, then a drop.
+        Purpose: The thinking block is closed, then one error event with the Kiro message; no
+        message_delta / message_stop; no new request.
+        """
+        recovery = _recovery()
+        items, raised = await _anthropic_with_recovery([aws_frames.reasoning("thinking"), _drop()], recovery)
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal_aborted(events) == ["thinking"]
+        assert events[-1][1]["error"]["message"] == CONNECTION_INTERRUPTED_MESSAGE
+        recovery.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rule6_complete_tool_then_drop_is_delivered(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: Text, a complete tool call, then a drop.
+        Purpose: The tool_use block is delivered, stop_reason tool_use, message_stop, no request.
+        """
+        recovery = _recovery()
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.content("Reading.")] + _tool_bytes(aws_frames, "t1", "Read", '{"path": "/x"}')
+            + [_drop()],
+            recovery,
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["text", "tool_use"]
+        assert _tool_ids(events) == ["t1"]
+        assert [d for n, d in events if n == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+        recovery.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metering_seen_then_drop_finishes_normally(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: Text and metering, then a drop.
+        Purpose: A normal legal message, end_turn, no request.
+        """
+        recovery = _recovery()
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.content("Done."), aws_frames.context_usage(2.0), aws_frames.metering(0.3), _drop()],
+            recovery
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal(events) == ["text"]
+        assert [d for n, d in events if n == "message_delta"][0]["delta"]["stop_reason"] == "end_turn"
+        recovery.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovery_cap_reached_ends_with_an_error_event(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: Four attempts in a row drop mid tool call, the first after text.
+        Purpose: Three continuations, then the text block is closed and an error event ends the stream.
+        """
+        recovery = _recovery(
+            _half_tool(aws_frames, "t2") + [_drop()],
+            _half_tool(aws_frames, "t3") + [_drop()],
+            _half_tool(aws_frames, "t4") + [_drop()],
+        )
+        items, raised = await _anthropic_with_recovery(
+            [aws_frames.content("Start.")] + _half_tool(aws_frames, "t1") + [_drop()], recovery
+        )
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal_aborted(events) == ["text"]
+        assert recovery.make_request.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_drop_during_the_continuation_ends_with_an_error_event(
+        self, aws_frames, anthropic_sse, recovery_env
+    ):
+        """
+        What it does: The continuation streams text and drops again.
+        Purpose: The text block is closed, one error event, no further request.
+        """
+        recovery = _recovery([aws_frames.content("More."), _drop()])
+        items, raised = await _anthropic_with_recovery(_half_tool(aws_frames) + [_drop()], recovery)
+
+        assert raised is None
+        events = anthropic_sse.parse(items)
+        assert anthropic_sse.assert_legal_aborted(events) == ["text"]
+        assert _text_of(events) == "More."
+        assert recovery.make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failing_continuation_request_without_output_ends_with_an_error_event(
+        self, aws_frames, anthropic_sse, recovery_env
+    ):
+        """
+        What it does: Drop before any block; the continuation request fails.
+        Purpose: Only message_start and the error event reach the client.
+        """
+        recovery = RecoverySettings(
+            payload=_recovery_payload(), make_request=AsyncMock(side_effect=httpx.ConnectError("down"))
+        )
+        items, raised = await _anthropic_with_recovery(_half_tool(aws_frames) + [_drop()], recovery)
+
+        assert raised is None
+        names = [n for n, _ in anthropic_sse.parse(items)]
+        assert names == ["message_start", "error"]
+
+    @pytest.mark.asyncio
+    async def test_switch_off_keeps_the_old_behavior(self, aws_frames, anthropic_sse, recovery_env):
+        """
+        What it does: UPSTREAM_DROP_RETRY False, recovery given, drop after text.
+        Purpose: Old behavior: "Internal error" event and the raw drop propagates; no request.
+        """
+        recovery = _recovery()
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False), \
+                patch("kiro.streaming_anthropic.UPSTREAM_DROP_RETRY", False):
+            items, raised = await _anthropic_with_recovery(
+                [aws_frames.content("Hello"), _drop()], recovery
+            )
+
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        recovery.make_request.assert_not_awaited()
+        events = anthropic_sse.parse(items)
+        assert events[-1][0] == "error"
+        assert "Internal error" in events[-1][1]["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_no_content_or_partial_args_in_logs(self, aws_frames, recovery_env, loguru_messages):
+        """
+        What it does: Recovers a drop with secret text and partial arguments.
+        Purpose: The logs never contain them.
+        """
+        recovery = _recovery(_tool_bytes(aws_frames, "t2") + [aws_frames.metering(0.1)])
+        await _anthropic_with_recovery(
+            [aws_frames.content("SECRET_TEXT_c4f1"),
+             aws_frames.tool_start("Write", "t1"),
+             aws_frames.tool_input('{"k": "SECRET_ARGS_c4f1', "Write", "t1"),
+             _drop()],
+            recovery,
+        )
+
+        joined = "\n".join(loguru_messages)
+        assert any("[StreamRecovery]" in m for m in loguru_messages)
+        assert "SECRET_TEXT_c4f1" not in joined
+        assert "SECRET_ARGS_c4f1" not in joined
+
+
+class TestCollectAnthropicResponseRecovery:
+    """collect_anthropic_response(recovery=...) (non-streaming): recovery is invisible."""
+
+    @staticmethod
+    async def _collect(first, recovery):
+        """Runs the collector over a scripted first attempt."""
+        cache = MagicMock()
+        cache.get_max_input_tokens.return_value = 200000
+        return await collect_anthropic_response(
+            _scripted_response(first), "claude-haiku-5.5", cache, MagicMock(), recovery=recovery
+        )
+
+    @pytest.mark.asyncio
+    async def test_rule2_returns_one_message_with_the_reissued_tool(self, aws_frames, recovery_env):
+        """
+        What it does: Text, half tool call, drop; the continuation re-issues the tool.
+        Purpose: Text block, one tool_use block (new id), stop_reason tool_use.
+        """
+        recovery = _recovery(_tool_bytes(aws_frames, "t2") + [aws_frames.metering(0.5)])
+        result = await self._collect(
+            [aws_frames.content("Writing.")] + _half_tool(aws_frames) + [_drop()], recovery
+        )
+
+        assert [b["type"] for b in result["content"]] == ["text", "tool_use"]
+        assert result["content"][0]["text"] == "Writing."
+        assert result["content"][1]["id"] == "t2"
+        assert result["stop_reason"] == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_rule3_resend_is_invisible(self, aws_frames, recovery_env):
+        """
+        What it does: Unknown frame, drop, then a good answer.
+        Purpose: The caller sees only the good answer.
+        """
+        recovery = _recovery([aws_frames.content("Hello"), aws_frames.context_usage(2.0), aws_frames.metering(0.1)])
+        result = await self._collect([aws_frames.build("unknownEvent", {"x": 1}), _drop()], recovery)
+
+        assert result["content"][0]["text"] == "Hello"
+        assert result["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_rule4_texts_of_both_attempts_are_concatenated(self, aws_frames, recovery_env):
+        """
+        What it does: Text, drop, resend with new text.
+        Purpose: Both texts are in the one text block.
+        """
+        recovery = _recovery([aws_frames.content(" and more."), aws_frames.metering(0.1)])
+        result = await self._collect([aws_frames.content("Some text"), _drop()], recovery)
+
+        assert result["content"][0]["text"] == "Some text and more."
+
+    @pytest.mark.asyncio
+    async def test_rule5_reasoning_only_raises(self, aws_frames, recovery_env):
+        """
+        What it does: Reasoning, then a drop.
+        Purpose: UpstreamStreamInterrupted(reasoning_only); no request.
+        """
+        recovery = _recovery()
+        with pytest.raises(UpstreamStreamInterrupted) as info:
+            await self._collect([aws_frames.reasoning("r"), _drop()], recovery)
+
+        assert info.value.reason == "reasoning_only"
+        recovery.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rule6_complete_tool_then_drop(self, aws_frames, recovery_env):
+        """
+        What it does: Complete tool call then a drop.
+        Purpose: The message carries the tool_use block, no request was made.
+        """
+        recovery = _recovery()
+        result = await self._collect(_tool_bytes(aws_frames, "t1") + [_drop()], recovery)
+
+        assert [b["id"] for b in result["content"] if b["type"] == "tool_use"] == ["t1"]
+        assert result["stop_reason"] == "tool_use"
+        recovery.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cap_reached_raises(self, aws_frames, recovery_env):
+        """
+        What it does: Every attempt drops mid tool call.
+        Purpose: After three continuations UpstreamStreamInterrupted(streak_exhausted) is raised.
+        """
+        recovery = _recovery(
+            _half_tool(aws_frames, "t2") + [_drop()],
+            _half_tool(aws_frames, "t3") + [_drop()],
+            _half_tool(aws_frames, "t4") + [_drop()],
+        )
+        with pytest.raises(UpstreamStreamInterrupted) as info:
+            await self._collect(_half_tool(aws_frames, "t1") + [_drop()], recovery)
+
+        assert info.value.reason == "streak_exhausted"
+        assert recovery.make_request.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_switch_off_keeps_the_old_behavior(self, aws_frames, recovery_env):
+        """
+        What it does: Switch off and a drop after text.
+        Purpose: The raw httpx error propagates.
+        """
+        recovery = _recovery()
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False):
+            with pytest.raises(httpx.RemoteProtocolError):
+                await self._collect([aws_frames.content("a"), _drop()], recovery)
+
+        recovery.make_request.assert_not_awaited()
+
+
+# ==================================================================================================
+# [ResponseSummary] fingerprint line
+# ==================================================================================================
+
+def _anthropic_summary_lines(messages):
+    """Returns the [ResponseSummary] lines of a captured log."""
+    return [m for m in messages if "[ResponseSummary]" in m]
+
+
+class TestAnthropicResponseSummaryLog:
+    """Streaming and non-streaming Anthropic responses write one [ResponseSummary] INFO line."""
+
+    @staticmethod
+    async def _stream_logs(chunks):
+        """Runs the Anthropic retry wrapper over real bytes; returns the captured INFO log."""
+        from loguru import logger
+        messages = []
+        handler_id = logger.add(lambda m: messages.append(str(m)), level="INFO", format="{level}|{message}")
+        try:
+            with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+                await TestStreamingAnthropicEmptyUpstream._run(_real_stream_response(chunks))
+        finally:
+            logger.remove(handler_id)
+        return messages
+
+    @staticmethod
+    async def _collect_logs(chunks):
+        """Runs collect_anthropic_response over real bytes; returns the captured INFO log."""
+        from loguru import logger
+        cache = MagicMock()
+        cache.get_max_input_tokens.return_value = 200000
+        messages = []
+        handler_id = logger.add(lambda m: messages.append(str(m)), level="INFO", format="{level}|{message}")
+        try:
+            with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True):
+                await collect_anthropic_response(
+                    _real_stream_response(chunks), "claude-sonnet-4.5", cache, MagicMock()
+                )
+        finally:
+            logger.remove(handler_id)
+        return messages
+
+    @pytest.mark.asyncio
+    async def test_streaming_text_response(self, aws_frames):
+        """
+        What it does: Normal reasoning + text stream.
+        Purpose: One line with finish=end_turn, sizes and metering=true.
+        """
+        lines = _anthropic_summary_lines(await self._stream_logs([_normal_bytes(aws_frames)]))
+        assert len(lines) == 1
+        assert lines[0].startswith("INFO|")
+        assert "api=anthropic" in lines[0]
+        assert "finish=end_turn" in lines[0]
+        assert "text_chars=11" in lines[0]
+        assert "reasoning_chars=5" in lines[0]
+        assert "metering=true" in lines[0]
+        assert "empty=false" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_streaming_tool_call_response(self, aws_frames):
+        """
+        What it does: Text, then one complete Write tool call.
+        Purpose: finish=tool_use and the tool name are in the line.
+        """
+        data = (
+            aws_frames.content("ok") + aws_frames.tool_start("Write", "t1")
+            + aws_frames.tool_input('{"file_path": "/tmp/a"}', "Write", "t1")
+            + aws_frames.tool_stop("Write", "t1")
+            + aws_frames.context_usage(5.0) + aws_frames.metering(0.5)
+        )
+        lines = _anthropic_summary_lines(await self._stream_logs([data]))
+        assert len(lines) == 1
+        assert "finish=tool_use" in lines[0]
+        assert "tool_calls=1[Write]" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_streaming_empty_metered_response_is_flagged(self, aws_frames):
+        """
+        What it does: Only contextUsageEvent + meteringEvent (a genuine empty answer).
+        Purpose: empty=true appears in the line.
+        """
+        lines = _anthropic_summary_lines(
+            await self._stream_logs([aws_frames.context_usage(2.0) + aws_frames.metering(0.1)])
+        )
+        assert len(lines) == 1
+        assert "empty=true" in lines[0]
+        assert "metering=true" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_summary_never_contains_message_text(self, aws_frames):
+        """
+        What it does: Streams and collects a distinctive answer text and reasoning.
+        Purpose: Only sizes are logged, in both modes.
+        """
+        data = (
+            aws_frames.reasoning("SECRET_REASONING_f00d") + aws_frames.content("SECRET_ANSWER_beef")
+            + aws_frames.context_usage(5.0) + aws_frames.metering(0.5)
+        )
+        assert not [m for m in await self._stream_logs([data]) if "SECRET_" in m]
+        assert not [m for m in await self._collect_logs([data]) if "SECRET_" in m]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_text_response(self, aws_frames):
+        """
+        What it does: collect_anthropic_response over a normal answer.
+        Purpose: Non-streaming Anthropic requests are fingerprinted once, with the same fields.
+        """
+        lines = _anthropic_summary_lines(await self._collect_logs([_normal_bytes(aws_frames)]))
+        assert len(lines) == 1
+        assert "api=anthropic" in lines[0]
+        assert "finish=end_turn" in lines[0]
+        assert "text_chars=11" in lines[0]
+        assert "metering=true" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_tool_call_response(self, aws_frames):
+        """
+        What it does: collect_anthropic_response over a tool call.
+        Purpose: finish=tool_use and the tool name are logged in non-streaming mode too.
+        """
+        data = (
+            aws_frames.tool_start("Read", "t1")
+            + aws_frames.tool_input('{"path": "/tmp/a"}', "Read", "t1")
+            + aws_frames.tool_stop("Read", "t1")
+            + aws_frames.context_usage(5.0) + aws_frames.metering(0.5)
+        )
+        lines = _anthropic_summary_lines(await self._collect_logs([data]))
+        assert len(lines) == 1
+        assert "finish=tool_use" in lines[0]
+        assert "tool_calls=1[Read]" in lines[0]

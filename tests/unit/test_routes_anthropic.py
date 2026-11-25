@@ -3665,3 +3665,314 @@ class TestForwardModelRequestFieldsRoutes:
         field_logs = [m for m in loguru_messages if "additionalModelRequestFields" in m or "Not forwarding" in m]
         assert field_logs
         assert not [m for m in field_logs if "SECRET-SENTINEL" in m]
+
+
+# ==================================================================================================
+# Mid-stream drop recovery - all four route paths
+# ==================================================================================================
+
+DROP_RECOVERY_TEXT = "peer closed connection without sending complete message body (incomplete chunked read)"
+INTERRUPTED_MESSAGE = "Your connection was interrupted. Please try again in a moment."
+
+
+class TestStreamDropRecoveryRoutes:
+    """
+    The upstream closes the stream in the middle of a tool call. /v1/messages must recover on
+    ALL FOUR paths (account-system / legacy x streaming / non-streaming): the client sees one
+    logical message, the continuation request reuses the conversation, and a give-up ends with
+    an in-stream error event (streaming) or HTTP 502 (non-streaming) without touching the
+    account's health.
+    """
+
+    @staticmethod
+    def _dropping(chunks):
+        """Response whose stream yields chunks and then raises the upstream drop error."""
+        response = AsyncMock(spec=httpx.Response)
+        response.status_code = 200
+        response.aclose = AsyncMock()
+
+        async def gen():
+            for chunk in chunks:
+                yield chunk
+            raise httpx.RemoteProtocolError(DROP_RECOVERY_TEXT)
+
+        response.aiter_bytes = lambda *a, **k: gen()
+        return response
+
+    @staticmethod
+    def _tool_calls(aws_frames, args='{"city": "Paris"}'):
+        """Frames of one complete get_weather call plus the closing metadata."""
+        return (
+            aws_frames.tool_start("get_weather", "tooluse_2")
+            + aws_frames.tool_input(args, "get_weather", "tooluse_2")
+            + aws_frames.tool_stop("get_weather", "tooluse_2")
+            + aws_frames.context_usage(2.0)
+            + aws_frames.metering(0.4)
+        )
+
+    @staticmethod
+    def _interrupted_tool(aws_frames):
+        """Text and a half-received tool call (the stream is cut after these frames)."""
+        return (
+            aws_frames.content("Let me check.")
+            + aws_frames.tool_start("get_weather", "tooluse_1")
+            + aws_frames.tool_input('{"city": "Par', "get_weather", "tooluse_1")
+        )
+
+    @staticmethod
+    def _post(test_client, key, responses, stream, switch_on=True):
+        """POSTs /v1/messages with a tool; request_with_retry returns `responses` in order."""
+        body = {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Weather in Paris?"}],
+            "stream": stream,
+            "tools": [{
+                "name": "get_weather",
+                "description": "Weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }],
+        }
+        with patch("kiro.routes_anthropic.KiroHttpClient") as client_class, \
+                patch("kiro.streaming_core.backoff_sleep", new=AsyncMock()), \
+                patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", switch_on):
+            instance = AsyncMock()
+            instance.request_with_retry = AsyncMock(side_effect=list(responses))
+            instance.close = AsyncMock()
+            client_class.return_value = instance
+            response = test_client.post("/v1/messages", headers={"x-api-key": key}, json=body)
+            return response, instance
+
+    @staticmethod
+    def _install(test_client, monkeypatch, account_system):
+        return TestNativeReasoningRouteCoverage._install_account_manager(
+            test_client.app.state, monkeypatch, account_system
+        )
+
+    @staticmethod
+    def _sent_payloads(instance):
+        """Payload objects of every request_with_retry call, in order."""
+        return [call.args[2] for call in instance.request_with_retry.call_args_list]
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_streaming_drop_mid_tool_is_recovered_into_one_message(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, anthropic_sse,
+        monkeypatch, account_system
+    ):
+        """
+        What it does: Text, a half-received tool call, then the drop; the continuation answers.
+        Goal: Legal SSE with ONE message_start, text then ONE tool_use block with the full input,
+        stop_reason tool_use; the continuation carries the same conversationId and the failed result.
+        """
+        from kiro.stream_recovery import INTERRUPTED_TOOL_RESULT_MESSAGE
+        manager = self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([self._interrupted_tool(aws_frames)])
+        second = mock_httpx_response(status_code=200, stream_chunks=[self._tool_calls(aws_frames)])
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [first, second], True)
+
+        assert response.status_code == 200
+        events = anthropic_sse.parse([response.text])
+        assert anthropic_sse.assert_legal(events) == ["text", "tool_use"]
+        starts = [d for e, d in events if e == "content_block_start"]
+        assert starts[1]["content_block"]["name"] == "get_weather"
+        partial = "".join(
+            d["delta"]["partial_json"] for e, d in events
+            if e == "content_block_delta" and d["delta"]["type"] == "input_json_delta"
+        )
+        assert json.loads(partial) == {"city": "Paris"}
+        text = "".join(
+            d["delta"]["text"] for e, d in events
+            if e == "content_block_delta" and d["delta"]["type"] == "text_delta"
+        )
+        assert text == "Let me check."
+        assert [d for e, d in events if e == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+
+        sent = self._sent_payloads(instance)
+        assert len(sent) == 2
+        assert sent[1]["conversationState"]["conversationId"] == sent[0]["conversationState"]["conversationId"]
+        results = sent[1]["conversationState"]["currentMessage"]["userInputMessage"][
+            "userInputMessageContext"]["toolResults"]
+        assert [r["content"][0]["text"] for r in results] == [INTERRUPTED_TOOL_RESULT_MESSAGE]
+        assert results[0]["status"] == "error"
+        manager.report_failure.assert_not_awaited()
+        if account_system:
+            manager.report_success.assert_awaited_once()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_non_streaming_drop_mid_tool_is_recovered_invisibly(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: Same drop, non-streaming request.
+        Goal: HTTP 200 with the text of the first attempt and the re-issued tool_use block.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([self._interrupted_tool(aws_frames)])
+        second = mock_httpx_response(status_code=200, stream_chunks=[self._tool_calls(aws_frames)])
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [first, second], False)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stop_reason"] == "tool_use"
+        assert [b["type"] for b in body["content"]] == ["text", "tool_use"]
+        assert body["content"][0]["text"] == "Let me check."
+        assert body["content"][1]["name"] == "get_weather"
+        assert body["content"][1]["input"] == {"city": "Paris"}
+        assert instance.request_with_retry.await_count == 2
+        manager.report_failure.assert_not_awaited()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_streaming_give_up_ends_with_error_event(
+        self, test_client, valid_proxy_api_key, aws_frames, anthropic_sse, monkeypatch, account_system
+    ):
+        """
+        What it does: The drop happens after reasoning only (Kiro rule 5: no recovery).
+        Goal: A legal aborted stream: one message_start, an error event with the Kiro message,
+        no message_stop; no second upstream request; the account is not penalised.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([aws_frames.reasoning("thinking hard")])
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [first], True)
+
+        assert response.status_code == 200
+        events = anthropic_sse.parse([response.text])
+        anthropic_sse.assert_legal_aborted(events)
+        assert events[-1][1]["error"]["message"] == INTERRUPTED_MESSAGE
+        assert instance.request_with_retry.await_count == 1
+        manager.report_failure.assert_not_awaited()
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_non_streaming_give_up_returns_502_without_account_failure(
+        self, test_client, valid_proxy_api_key, aws_frames, monkeypatch, account_system
+    ):
+        """
+        What it does: Reasoning-only drop on a non-streaming request.
+        Goal: HTTP 502 with the Kiro message in the Anthropic error shape and x-should-retry;
+        no report_failure / report_success, no failover, the client is closed.
+        """
+        manager = self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([aws_frames.reasoning("thinking hard")])
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [first], False)
+
+        assert response.status_code == 502
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "api_error", "message": INTERRUPTED_MESSAGE},
+        }
+        assert response.headers["x-should-retry"] == "true"
+        assert instance.request_with_retry.await_count == 1
+        instance.close.assert_awaited()
+        manager.report_failure.assert_not_awaited()
+        manager.report_success.assert_not_awaited()
+        if account_system:
+            assert manager.get_next_account.await_count == 1
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_drop_during_the_continuation_gives_up(
+        self, test_client, valid_proxy_api_key, aws_frames, anthropic_sse, monkeypatch, account_system, stream
+    ):
+        """
+        What it does: The continuation attempt drops as well, before it produced anything.
+        Goal: Streaming: legal aborted stream with one error event. Non-streaming: 502.
+        Exactly two upstream requests.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        responses = [
+            self._dropping([self._interrupted_tool(aws_frames)]),
+            self._dropping([aws_frames.reasoning("hmm")]),
+        ]
+
+        response, instance = self._post(test_client, valid_proxy_api_key, responses, stream)
+
+        assert instance.request_with_retry.await_count == 2
+        if stream:
+            events = anthropic_sse.parse([response.text])
+            anthropic_sse.assert_legal_aborted(events)
+            assert events[-1][1]["error"]["message"] == INTERRUPTED_MESSAGE
+        else:
+            assert response.status_code == 502
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_complete_tool_call_followed_by_drop_is_delivered_without_resend(
+        self, test_client, valid_proxy_api_key, aws_frames, anthropic_sse, monkeypatch, account_system, stream
+    ):
+        """
+        What it does: The tool call is complete (stop frame), then the connection drops.
+        Goal: Kiro rule 6: the tool call is delivered, stop_reason tool_use, no new request.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([
+            aws_frames.content("Checking.") + self._tool_calls(aws_frames).replace(
+                aws_frames.metering(0.4), b""
+            )
+        ])
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [first], stream)
+
+        assert response.status_code == 200
+        assert instance.request_with_retry.await_count == 1
+        if stream:
+            events = anthropic_sse.parse([response.text])
+            assert anthropic_sse.assert_legal(events) == ["text", "tool_use"]
+            assert [d for e, d in events if e == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
+        else:
+            body = response.json()
+            assert body["stop_reason"] == "tool_use"
+            assert [b["type"] for b in body["content"]] == ["text", "tool_use"]
+
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_drop_before_any_output_resends_the_same_payload_object(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, anthropic_sse,
+        monkeypatch, account_system
+    ):
+        """
+        What it does: The first response drops before a single frame; the resend is answered.
+        Goal: The resend sends the SAME payload object (so the in-place additionalModelRequestFields
+        fallback of KiroHttpClient keeps working) and the client sees a normal message.
+        """
+        self._install(test_client, monkeypatch, account_system)
+        second = mock_httpx_response(
+            status_code=200,
+            stream_chunks=[aws_frames.content("Hi") + aws_frames.context_usage(1.0) + aws_frames.metering(0.1)],
+        )
+
+        response, instance = self._post(test_client, valid_proxy_api_key, [self._dropping([]), second], True)
+
+        assert response.status_code == 200
+        events = anthropic_sse.parse([response.text])
+        assert anthropic_sse.assert_legal(events) == ["text"]
+        sent = self._sent_payloads(instance)
+        assert len(sent) == 2 and sent[0] is sent[1]
+
+    @pytest.mark.parametrize("stream", [True, False])
+    @pytest.mark.parametrize("account_system", [True, False])
+    def test_switch_off_restores_the_old_behaviour(
+        self, test_client, valid_proxy_api_key, mock_httpx_response, aws_frames, monkeypatch,
+        account_system, stream
+    ):
+        """
+        What it does: UPSTREAM_DROP_RETRY=false and a drop mid tool call.
+        Goal: No continuation request is sent and the Kiro "connection interrupted" message
+        is not produced (the old generic error path runs).
+        """
+        self._install(test_client, monkeypatch, account_system)
+        first = self._dropping([self._interrupted_tool(aws_frames)])
+        second = mock_httpx_response(status_code=200, stream_chunks=[self._tool_calls(aws_frames)])
+
+        response, instance = self._post(
+            test_client, valid_proxy_api_key, [first, second], stream, switch_on=False
+        )
+
+        assert instance.request_with_retry.await_count == 1
+        assert INTERRUPTED_MESSAGE not in response.text
+        if stream:
+            assert "event: error" in response.text
+            assert "tool_use" not in response.text
+        else:
+            assert response.status_code >= 500

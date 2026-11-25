@@ -47,7 +47,12 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
 )
 from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
-from kiro.empty_response import build_incomplete_stream_error_openai, log_incomplete_stream
+from kiro.empty_response import (
+    build_incomplete_stream_error_openai,
+    build_stream_interrupted_error_openai,
+    log_incomplete_stream,
+)
+from kiro.stream_recovery import RecoverySettings, UpstreamStreamInterrupted
 from kiro.upstream_guard import EmptyUpstreamResponseError, StreamOutcome
 
 
@@ -60,7 +65,9 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     check_stream_outcome,
     guard_upstream_response,
+    log_response_summary,
     stream_with_first_token_retry as stream_with_first_token_retry_core,
+    wrap_recoverable,
 )
 
 if TYPE_CHECKING:
@@ -118,9 +125,15 @@ async def stream_kiro_to_openai_internal(
     Yields:
         Strings in SSE format: "data: {...}\\n\\n" or "data: [DONE]\\n\\n"
     
+    A mid-stream upstream drop that a recovery session could not recover
+    (UpstreamStreamInterrupted) ends the stream with an error chunk and [DONE]. With
+    raise_on_incomplete the exception propagates instead, because nothing was sent to the
+    client. A raw drop (no recovery session) keeps propagating to the route.
+    
     Raises:
         FirstTokenTimeoutError: If first token not received within timeout
         EmptyUpstreamResponseError: Incomplete upstream response and raise_on_incomplete
+        UpstreamStreamInterrupted: Unrecoverable drop and raise_on_incomplete
     
     Example:
         >>> async for chunk in stream_kiro_to_openai_internal(client, response, "claude-sonnet-4", cache, auth):
@@ -330,7 +343,17 @@ async def stream_kiro_to_openai_internal(
             finish_reason = "tool_calls"
         else:
             finish_reason = "stop"
-        
+        # Fingerprint of what is sent to the client (sizes only, never content)
+        log_response_summary(
+            api="openai",
+            model=model,
+            finish_reason=finish_reason,
+            text_chars=len(full_content),
+            reasoning_chars=len(full_thinking_content),
+            tool_names=[str((tc.get("function") or {}).get("name") or "") for tc in all_tool_calls],
+            truncated_tools=sum(1 for tc in all_tool_calls if tc.get("_truncation_detected")),
+            metering_seen=received_usage,
+        )
         # Count completion_tokens (output) using tiktoken
         completion_tokens = count_tokens(full_content + full_thinking_content)
         
@@ -452,6 +475,15 @@ async def stream_kiro_to_openai_internal(
     except EmptyUpstreamResponseError:
         # Reported by the route (HTTP error); not an unexpected streaming error
         raise
+    except UpstreamStreamInterrupted as e:
+        streaming_error_occurred = True
+        if raise_on_incomplete:
+            # Aggregated into a non-streaming response: the route answers with an HTTP error
+            raise
+        # The upstream dropped the stream and recovery gave up: tell the client explicitly
+        logger.error(f"[StreamRecovery] stream ended with an error chunk: reason={e.reason}")
+        yield build_stream_interrupted_error_openai()
+        yield "data: [DONE]\n\n"
     except GeneratorExit:
         # Client disconnected - this is normal, don't log as error
         logger.debug("Client disconnected (GeneratorExit)")
@@ -534,7 +566,8 @@ async def stream_with_first_token_retry(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    emit_ready_marker: bool = False
+    emit_ready_marker: bool = False,
+    recovery: Optional[RecoverySettings] = None,
 ) -> AsyncGenerator[Union[str, StreamReadyMarker], None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -561,6 +594,9 @@ async def stream_with_first_token_retry(
         request_tools: Original request tools (for fallback token counting)
         emit_ready_marker: Yield STREAM_READY once the upstream response was accepted
             (see streaming_core.prime_sse_stream)
+        recovery: Optional mid-stream drop recovery settings. When given (and
+            UPSTREAM_DROP_RETRY is on), every accepted response is wrapped in a recovery
+            session, so a dropped stream is continued inside the same SSE response.
     
     Yields:
         Strings in SSE format, preceded by STREAM_READY when requested
@@ -596,7 +632,7 @@ async def stream_with_first_token_retry(
         """Process response and yield OpenAI SSE chunks."""
         async for chunk in stream_kiro_to_openai_internal(
             client,
-            response,
+            wrap_recoverable(response, recovery),
             model,
             model_cache,
             auth_manager,
@@ -626,7 +662,8 @@ async def collect_stream_response(
     model_cache: "ModelInfoCache",
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    recovery: Optional[RecoverySettings] = None,
 ) -> dict:
     """
     Collect full response from streaming stream.
@@ -642,6 +679,8 @@ async def collect_stream_response(
         auth_manager: Authentication manager
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        recovery: Optional mid-stream drop recovery settings. Nothing was sent to the
+            client yet, so a recovered drop is invisible in the returned response.
     
     Returns:
         Dictionary with full response in OpenAI chat.completion format
@@ -651,9 +690,11 @@ async def collect_stream_response(
             metering) and EMPTY_RESPONSE_AS_ERROR is enabled, or it was incomplete
             (reasoning only, no metering, no text, no tool_use) and
             INCOMPLETE_RESPONSE_AS_ERROR is enabled
+        UpstreamStreamInterrupted: A mid-stream drop could not be recovered
     """
     # Reject an empty upstream response before any SSE formatting starts
     response = await guard_upstream_response(response, FIRST_TOKEN_TIMEOUT)
+    response = wrap_recoverable(response, recovery)
     
     full_content = ""
     full_reasoning_content = ""

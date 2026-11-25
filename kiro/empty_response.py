@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from kiro.config import EMPTY_RESPONSE_ERROR_STATUS, INCOMPLETE_RESPONSE_ERROR_TYPE
+from kiro.stream_recovery import CONNECTION_INTERRUPTED_MESSAGE, UpstreamStreamInterrupted
 from kiro.tokenizer import estimate_request_tokens
 from kiro.upstream_guard import KIND_INCOMPLETE, EmptyUpstreamResponseError, StreamOutcome
 
@@ -76,9 +77,13 @@ ANTHROPIC_OVERLOADED_STATUS = 529
 # Machine-readable code of the OpenAI error body
 OPENAI_EMPTY_RESPONSE_CODE = "upstream_empty_response"
 OPENAI_INCOMPLETE_RESPONSE_CODE = "upstream_incomplete_response"
+OPENAI_STREAM_INTERRUPTED_CODE = "upstream_stream_interrupted"
 
 # Type of the OpenAI error body and of the OpenAI in-stream error chunk
 OPENAI_ERROR_TYPE = "server_error"
+
+# HTTP status of a non-streaming response whose mid-stream drop could not be recovered
+STREAM_INTERRUPTED_STATUS = 502
 
 # Value of the "action" field in the incomplete-response WARNING of a streaming response
 ACTION_ERROR_EVENT = "error_event"
@@ -318,6 +323,115 @@ def build_incomplete_stream_error_openai() -> str:
         }
     }
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def build_stream_interrupted_error_anthropic() -> str:
+    """
+    Build the Anthropic SSE error event that ends a stream the upstream dropped mid-response.
+
+    Used when mid-stream drop recovery is not possible or exhausted. The message is the one
+    the Kiro IDE shows (CONNECTION_INTERRUPTED_MESSAGE); no content or request data is included.
+
+    Returns:
+        SSE string "event: error\ndata: {...}\n\n"
+    """
+    data = {
+        "type": "error",
+        "error": {"type": INCOMPLETE_RESPONSE_ERROR_TYPE, "message": CONNECTION_INTERRUPTED_MESSAGE},
+    }
+    return f"event: error\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def build_stream_interrupted_error_openai() -> str:
+    """
+    Build the OpenAI SSE error chunk that ends a stream the upstream dropped mid-response.
+
+    Same shape as build_incomplete_stream_error_openai (a data line with a truthy "error" key,
+    which the OpenAI SDKs raise an APIError for). The caller sends "data: [DONE]" after it.
+
+    Returns:
+        SSE string "data: {"error": {...}}\n\n"
+    """
+    data = {
+        "error": {
+            "message": CONNECTION_INTERRUPTED_MESSAGE,
+            "type": OPENAI_ERROR_TYPE,
+            "param": None,
+            "code": OPENAI_STREAM_INTERRUPTED_CODE,
+        }
+    }
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _log_stream_interrupted(exc: UpstreamStreamInterrupted, model: str, path: str) -> None:
+    """
+    Log a non-streaming request that gave up after an unrecoverable upstream drop (WARNING).
+
+    Only the model, the machine-readable reason and the status are logged, never content.
+
+    Args:
+        exc: The give-up exception
+        model: Requested model name
+        path: Endpoint path for the access log line
+    """
+    logger.warning(
+        "HTTP {} - POST {} (non-streaming) - upstream stream interrupted, recovery gave up "
+        "(model={}, reason={})",
+        STREAM_INTERRUPTED_STATUS,
+        path,
+        model,
+        exc.reason,
+    )
+    if debug_logger:
+        debug_logger.flush_on_error(STREAM_INTERRUPTED_STATUS, CONNECTION_INTERRUPTED_MESSAGE)
+
+
+def handle_stream_interrupted_anthropic(exc: UpstreamStreamInterrupted, model: str) -> JSONResponse:
+    """
+    Build the Anthropic-format HTTP 502 for a non-streaming request whose recovery gave up.
+
+    Args:
+        exc: The give-up exception
+        model: Requested model name (for the log)
+
+    Returns:
+        JSONResponse with status 502 and an Anthropic error body
+    """
+    _log_stream_interrupted(exc, model, ANTHROPIC_PATH)
+    return JSONResponse(
+        status_code=STREAM_INTERRUPTED_STATUS,
+        content={
+            "type": "error",
+            "error": {"type": "api_error", "message": CONNECTION_INTERRUPTED_MESSAGE},
+        },
+        headers=SHOULD_RETRY_HEADERS,
+    )
+
+
+def handle_stream_interrupted_openai(exc: UpstreamStreamInterrupted, model: str) -> JSONResponse:
+    """
+    Build the OpenAI-format HTTP 502 for a non-streaming request whose recovery gave up.
+
+    Args:
+        exc: The give-up exception
+        model: Requested model name (for the log)
+
+    Returns:
+        JSONResponse with status 502 and an OpenAI error body
+    """
+    _log_stream_interrupted(exc, model, OPENAI_PATH)
+    return JSONResponse(
+        status_code=STREAM_INTERRUPTED_STATUS,
+        content={
+            "error": {
+                "message": CONNECTION_INTERRUPTED_MESSAGE,
+                "type": OPENAI_ERROR_TYPE,
+                "param": None,
+                "code": OPENAI_STREAM_INTERRUPTED_CODE,
+            }
+        },
+        headers=SHOULD_RETRY_HEADERS,
+    )
 
 
 def log_incomplete_stream(outcome: StreamOutcome, model: str, action: str = ACTION_ERROR_EVENT) -> None:

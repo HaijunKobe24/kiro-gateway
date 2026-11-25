@@ -34,11 +34,13 @@ to convert Kiro events to their respective SSE formats.
 """
 
 import asyncio
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict, List, Optional, Tuple, Union
 
 import httpx
+from fastapi import HTTPException
 from loguru import logger
 
 from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
@@ -49,6 +51,18 @@ from kiro.config import (
     FAKE_REASONING_HANDLING,
     EMPTY_RESPONSE_AS_ERROR,
     INCOMPLETE_RESPONSE_AS_ERROR,
+    UPSTREAM_DROP_RETRY,
+)
+from kiro.stream_recovery import (
+    AttemptEvidence,
+    RecoveryAction,
+    RecoveryBudget,
+    RecoverySettings,
+    UpstreamStreamInterrupted,
+    backoff_sleep,
+    build_continuation_payload,
+    compute_backoff_s,
+    decide_recovery,
 )
 from kiro.thinking_parser import ThinkingParser, format_native_reasoning
 from kiro.upstream_guard import (
@@ -177,6 +191,52 @@ async def parse_kiro_stream(
     """
     Parses Kiro SSE stream and yields unified events.
     
+    Thin dispatcher over _parse_single_stream (one HTTP response). See there for details.
+    When response is a RecoverableResponse, the attempts of its recovery session are
+    parsed instead and their events form one continuous stream.
+    
+    Args:
+        response: HTTP response with data stream
+        first_token_timeout: First token wait timeout (seconds)
+        enable_thinking_parser: Whether to enable thinking block parsing
+        outcome: Optional side channel (see _parse_single_stream)
+    
+    Yields:
+        KiroEvent objects representing stream events
+    
+    Raises:
+        FirstTokenTimeoutError: If first token not received within timeout
+        UpstreamStreamInterrupted: Recovery session only: the drop could not be recovered
+    """
+    inner: AsyncGenerator[KiroEvent, None]
+    if isinstance(response, RecoverableResponse):
+        # One logical response made of several upstream attempts (mid-stream drop recovery)
+        inner = response.events(first_token_timeout, enable_thinking_parser, outcome)
+    else:
+        inner = _parse_single_stream(
+            response,
+            first_token_timeout,
+            enable_thinking_parser,
+            outcome,
+        )
+    try:
+        async for event in inner:
+            yield event
+    finally:
+        # Close the inner generator deterministically (consumer break / cancellation)
+        await inner.aclose()
+
+
+async def _parse_single_stream(
+    response: httpx.Response,
+    first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
+    enable_thinking_parser: bool = True,
+    outcome: Optional[StreamOutcome] = None,
+    evidence: Optional[AttemptEvidence] = None,
+) -> AsyncGenerator[KiroEvent, None]:
+    """
+    Parses ONE Kiro HTTP response and yields unified events.
+    
     This is the core parsing function that converts Kiro's AWS SSE format
     into unified KiroEvent objects that can be formatted for any API.
     
@@ -194,6 +254,11 @@ async def parse_kiro_stream(
             and tool_use output is recorded, and finished is set to True only when the
             stream ended normally (never on an exception, cancellation or early close).
             Consumers read outcome.verdict() after their loop (see check_stream_outcome).
+        evidence: Optional side channel for stream-drop recovery. Filled when the generator
+            ends, whether normally, by an exception or by being closed: text and reasoning
+            produced, tool calls whose stop frame arrived, the tool call that was still
+            streaming (raw partial arguments, never finalized) and whether a meteringEvent
+            arrived.
     
     Yields:
         KiroEvent objects representing stream events
@@ -249,6 +314,8 @@ async def parse_kiro_stream(
                 first_token_received = True
             if outcome is not None:
                 outcome.record_event(event)
+            if evidence is not None:
+                evidence.record_event(event)
             yield event
         
         # Continue reading remaining chunks
@@ -260,6 +327,8 @@ async def parse_kiro_stream(
             async for event in _process_chunk(parser, chunk, thinking_parser, reasoning_stats):
                 if outcome is not None:
                     outcome.record_event(event)
+                if evidence is not None:
+                    evidence.record_event(event)
                 yield event
         
         # Finalize thinking parser and yield any remaining content
@@ -273,6 +342,8 @@ async def parse_kiro_stream(
                     final_result.is_last_thinking_chunk,
                 )
                 if processed_thinking:
+                    if evidence is not None:
+                        evidence.reasoning_seen = True
                     yield KiroEvent(
                         type="thinking",
                         thinking_content=processed_thinking,
@@ -284,6 +355,8 @@ async def parse_kiro_stream(
                 final_content_event = KiroEvent(type="content", content=final_result.regular_content)
                 if outcome is not None:
                     outcome.record_event(final_content_event)
+                if evidence is not None:
+                    evidence.record_event(final_content_event)
                 yield final_content_event
             
             if thinking_parser.found_thinking_block:
@@ -315,6 +388,14 @@ async def parse_kiro_stream(
         logger.error(f"Error during stream parsing: [{error_type}] {error_msg}", exc_info=True)
         raise
     finally:
+        if evidence is not None:
+            # Read the tool state BEFORE any finalization: the interrupted tool keeps its raw
+            # partial arguments (get_tool_calls() would normalize them to "{}")
+            evidence.completed_tools, evidence.interrupted_tool = parser.pending_tool_state()
+            evidence.saw_metering = frame_scanner.saw_metering
+            if reasoning_stats.frames > 0 or (thinking_parser is not None and thinking_parser.found_thinking_block):
+                # Also covers reasoning frames discarded by FAKE_REASONING_HANDLING=remove
+                evidence.reasoning_seen = True
         # Per-stream frame summary (names and counts only, never payloads)
         logger.debug(
             f"[StreamFrames] bytes={frame_scanner.bytes_received}, "
@@ -486,6 +567,9 @@ async def guard_upstream_response(
         EmptyUpstreamResponseError: The stream ended and carried no output and no metering
         FirstTokenTimeoutError: No first chunk within first_token_timeout
     """
+    if isinstance(response, RecoverableResponse):
+        # Already guarded (its first attempt was peeked before it was wrapped)
+        return response
     if enabled is None:
         enabled = EMPTY_RESPONSE_AS_ERROR
     if not enabled:
@@ -665,7 +749,8 @@ def check_stream_outcome(outcome: StreamOutcome, enabled: Optional[bool] = None)
 async def collect_stream_to_result(
     response: httpx.Response,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
-    enable_thinking_parser: bool = True
+    enable_thinking_parser: bool = True,
+    recovery: Optional[RecoverySettings] = None,
 ) -> StreamResult:
     """
     Collects full response from Kiro stream.
@@ -683,6 +768,8 @@ async def collect_stream_to_result(
         response: HTTP response with stream
         first_token_timeout: First token wait timeout
         enable_thinking_parser: Whether to enable thinking block parsing
+        recovery: Optional mid-stream drop recovery settings (see wrap_recoverable). Nothing
+            was sent to the client yet, so a recovered drop is invisible to the caller.
     
     Returns:
         StreamResult with full content, thinking, tool calls, and usage
@@ -690,8 +777,10 @@ async def collect_stream_to_result(
     Raises:
         EmptyUpstreamResponseError: The upstream response was empty or incomplete
         FirstTokenTimeoutError: No first chunk within first_token_timeout
+        UpstreamStreamInterrupted: A mid-stream drop could not be recovered
     """
     response = await guard_upstream_response(response, first_token_timeout)
+    response = wrap_recoverable(response, recovery)
     result = StreamResult()
     full_content_for_bracket_tools = ""
     outcome = StreamOutcome()
@@ -759,6 +848,447 @@ def calculate_tokens_from_context_usage(
 
 
 # ==================================================================================================
+# Response summary (diagnostics)
+# ==================================================================================================
+
+# Longest tool name written to the summary line, and how many names are listed
+RESPONSE_SUMMARY_MAX_TOOL_NAME_LEN = 40
+RESPONSE_SUMMARY_MAX_TOOL_NAMES = 5
+
+
+def format_response_summary(
+    api: str,
+    model: str,
+    finish_reason: str,
+    text_chars: int,
+    reasoning_chars: int,
+    tool_names: List[str],
+    truncated_tools: int,
+    metering_seen: bool,
+) -> str:
+    """
+    Build the one-line fingerprint of a finished model response (no content, only sizes).
+
+    A response is "empty" when it carries no text, no reasoning and no tool call. Tool names
+    are metadata, not content: they are shortened and stripped of whitespace so a name can
+    never break the line.
+
+    Args:
+        api: Client API the response was produced for ("openai" or "anthropic")
+        model: Model name from the client request
+        finish_reason: finish_reason (OpenAI) or stop_reason (Anthropic) sent to the client
+        text_chars: Number of characters of answer text
+        reasoning_chars: Number of characters of reasoning text
+        tool_names: Names of the tool calls in the response, in order
+        truncated_tools: Number of tool calls whose arguments arrived truncated
+        metering_seen: Whether the upstream sent its end-of-response metering signal
+
+    Returns:
+        Space separated key=value fields
+    """
+    shown = [
+        "".join(str(name).split())[:RESPONSE_SUMMARY_MAX_TOOL_NAME_LEN]
+        for name in tool_names[:RESPONSE_SUMMARY_MAX_TOOL_NAMES]
+    ]
+    more = len(tool_names) - len(shown)
+    names_text = ",".join(shown) + (f",+{more}" if more > 0 else "")
+    empty = text_chars == 0 and reasoning_chars == 0 and not tool_names
+    return (
+        f"api={api} model={model} finish={finish_reason} text_chars={text_chars} "
+        f"reasoning_chars={reasoning_chars} tool_calls={len(tool_names)}[{names_text}] "
+        f"truncated_tools={truncated_tools} metering={str(metering_seen).lower()} "
+        f"empty={str(empty).lower()}"
+    )
+
+
+def log_response_summary(
+    api: str,
+    model: str,
+    finish_reason: str,
+    text_chars: int,
+    reasoning_chars: int,
+    tool_names: List[str],
+    truncated_tools: int = 0,
+    metering_seen: bool = True,
+) -> None:
+    """
+    Log one INFO [ResponseSummary] line for a finished response.
+
+    The line lets a client-side failure (for example a TRAE error code) be matched with what
+    the gateway actually sent: finish reason, sizes, tool calls, truncation, empty answers.
+    It never contains message content.
+
+    Args:
+        api: Client API the response was produced for ("openai" or "anthropic")
+        model: Model name from the client request
+        finish_reason: finish_reason (OpenAI) or stop_reason (Anthropic) sent to the client
+        text_chars: Number of characters of answer text
+        reasoning_chars: Number of characters of reasoning text
+        tool_names: Names of the tool calls in the response, in order
+        truncated_tools: Number of tool calls whose arguments arrived truncated
+        metering_seen: Whether the upstream sent its end-of-response metering signal
+    """
+    summary = format_response_summary(
+        api, model, finish_reason, text_chars, reasoning_chars,
+        tool_names, truncated_tools, metering_seen,
+    )
+    # Positional argument: tool names or models may contain braces that loguru would format
+    logger.info("[ResponseSummary] {}", summary)
+
+
+# ==================================================================================================
+# Upstream Connection Drop (mid-stream) Handling
+# ==================================================================================================
+
+# Exceptions raised by httpx when the upstream closes or breaks the connection while the
+# response body is being read ("peer closed connection without sending complete message body").
+UPSTREAM_DROP_EXCEPTIONS: Tuple[type, ...] = (httpx.RemoteProtocolError, httpx.ReadError)
+
+# Actions taken for a dropped stream (also written to the [StreamDrop] log line)
+DROP_ACTION_RETRY = "retry"
+DROP_ACTION_OUTPUT_SENT = "give_up:output_sent"
+DROP_ACTION_DISABLED = "give_up:disabled"
+DROP_ACTION_EXHAUSTED = "give_up:attempts_exhausted"
+
+
+def is_upstream_drop(error: BaseException) -> bool:
+    """
+    Tell whether an exception means the upstream dropped the connection mid-stream.
+
+    Args:
+        error: Exception raised while streaming
+
+    Returns:
+        True for httpx.RemoteProtocolError and httpx.ReadError, otherwise False
+    """
+    return isinstance(error, UPSTREAM_DROP_EXCEPTIONS)
+
+
+def decide_drop_action(
+    client_visible_chunks: int,
+    retry_enabled: bool,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    """
+    Decide what to do with a stream the upstream dropped.
+
+    A retry is only safe while the client has not received any model output: the SSE
+    formats cannot retract what was already sent, so a second answer would be appended to
+    the first one. Output-free preamble chunks (e.g. Anthropic message_start) do not count.
+
+    Args:
+        client_visible_chunks: Chunks with model output already yielded to the client
+        retry_enabled: Whether UPSTREAM_DROP_RETRY is on
+        attempt: Zero-based index of the attempt that failed
+        max_attempts: Total attempt budget
+
+    Returns:
+        One of the DROP_ACTION_* constants
+    """
+    if client_visible_chunks > 0:
+        return DROP_ACTION_OUTPUT_SENT
+    if not retry_enabled:
+        return DROP_ACTION_DISABLED
+    if attempt + 1 >= max_attempts:
+        return DROP_ACTION_EXHAUSTED
+    return DROP_ACTION_RETRY
+
+
+def describe_stream_drop(
+    response: Any,
+    error: Optional[BaseException],
+    attempt_started_at: float,
+    client_visible_chunks: int,
+) -> str:
+    """
+    Build the diagnostic fields of a [StreamDrop] log line (counts and timings only).
+
+    Byte and chunk counters come from GuardedResponse; for a response that is not wrapped
+    (guard disabled) they are reported as "n/a". No payload is ever included.
+
+    Args:
+        response: Response of the failed attempt (may be a GuardedResponse)
+        error: The exception that ended the stream, or None for a stream that completed
+        attempt_started_at: time.monotonic() when the attempt started
+        client_visible_chunks: Chunks with model output already yielded to the client
+
+    Returns:
+        Space separated key=value fields
+    """
+    now = time.monotonic()
+    bytes_read = getattr(response, "bytes_read", None)
+    chunks_read = getattr(response, "chunks_read", None)
+    last_chunk_at = getattr(response, "last_chunk_at", None)
+    max_gap = getattr(response, "max_gap_s", None)
+    bytes_text = str(bytes_read) if isinstance(bytes_read, int) else "n/a"
+    chunks_text = str(chunks_read) if isinstance(chunks_read, int) else "n/a"
+    if isinstance(last_chunk_at, (int, float)):
+        idle_text = f"{now - last_chunk_at:.1f}s"
+    else:
+        idle_text = "n/a"
+    return (
+        f"error={type(error).__name__ if error is not None else 'none'} "
+        f"elapsed={now - attempt_started_at:.1f}s "
+        f"bytes={bytes_text} chunks={chunks_text} idle={idle_text} "
+        f"max_gap={f'{max_gap:.1f}s' if isinstance(max_gap, float) else 'n/a'} "
+        f"client_chunks={client_visible_chunks}"
+    )
+
+
+# ==================================================================================================
+# Mid-stream Drop Recovery Session
+# ==================================================================================================
+
+class RecoverableResponse:
+    """
+    Response wrapper that turns several upstream attempts into one logical response.
+
+    parse_kiro_stream delegates to events() when it is given this wrapper, so the formatters
+    (OpenAI / Anthropic) see ONE continuous KiroEvent stream: a single role chunk or
+    message_start, consistent block indices, and tool calls, usage and finish reason for the
+    whole response. When an attempt is dropped by the upstream (see is_upstream_drop),
+    decide_recovery picks the Kiro IDE behaviour (resend, continue after an interrupted tool
+    call, deliver completed tool calls, or give up) and the next attempt is requested with
+    RecoverySettings.make_request.
+
+    The synthetic assistant turn and tool result of a tool recovery exist only in the
+    upstream request. Everything else is delegated to the current attempt's response.
+
+    Attributes:
+        status_code: Always 200 (only accepted responses are wrapped)
+    """
+
+    status_code: int = 200
+
+    def __init__(self, response: Any, settings: RecoverySettings) -> None:
+        """
+        Args:
+            response: Accepted (and guarded) response of the first attempt
+            settings: Base payload and request function used to build and send later attempts
+        """
+        self._current = response
+        self._settings = settings
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the current attempt's response."""
+        return getattr(self._current, name)
+
+    async def aclose(self) -> None:
+        """Close the response of the current attempt."""
+        await self._current.aclose()
+
+    async def _close_current_quietly(self) -> None:
+        """Close the current attempt's response, logging expected close errors at DEBUG."""
+        try:
+            await self._current.aclose()
+        except (httpx.HTTPError, RuntimeError, OSError) as close_error:
+            logger.debug(f"Error closing dropped upstream response: {close_error}")
+
+    async def _open_attempt(self, payload: Dict[str, Any], first_token_timeout: float) -> Any:
+        """
+        Send the request of a later attempt and peek at its stream.
+
+        Args:
+            payload: Kiro request payload of the attempt
+            first_token_timeout: Timeout for the first chunk (seconds)
+
+        Returns:
+            The accepted (guarded) response
+
+        Raises:
+            UpstreamStreamInterrupted: The request failed, was not HTTP 200, timed out or was empty
+            httpx.RemoteProtocolError / httpx.ReadError: The new stream dropped while it was peeked
+        """
+        try:
+            response = await self._settings.make_request(payload)
+        except (httpx.HTTPError, HTTPException, OSError) as e:
+            raise UpstreamStreamInterrupted("continuation_failed") from e
+
+        if response.status_code != 200:
+            logger.error(
+                f"[StreamRecovery] continuation request rejected: HTTP {response.status_code}"
+            )
+            try:
+                await response.aclose()
+            except (httpx.HTTPError, RuntimeError, OSError) as close_error:
+                logger.debug(f"Error closing rejected response: {close_error}")
+            raise UpstreamStreamInterrupted("continuation_failed")
+
+        try:
+            return await guard_upstream_response(response, first_token_timeout)
+        except UPSTREAM_DROP_EXCEPTIONS:
+            await aclose_shielded(response.aclose)
+            raise
+        except (FirstTokenTimeoutError, EmptyUpstreamResponseError) as e:
+            await aclose_shielded(response.aclose)
+            raise UpstreamStreamInterrupted("continuation_failed") from e
+
+    def _log_decision(
+        self,
+        attempt: int,
+        action: RecoveryAction,
+        reason: str,
+        evidence: AttemptEvidence,
+        backoff_s: float,
+        error: BaseException,
+        attempt_started_at: float,
+        events_sent: int,
+    ) -> None:
+        """
+        Log one recovery decision (counts and timings only, never content).
+
+        Args:
+            attempt: 1-based number of the attempt that dropped
+            action: The chosen action
+            reason: Reason string of the decision
+            evidence: Evidence of the dropped attempt
+            backoff_s: Wait before the next attempt (0 when none)
+            error: The exception that ended the attempt
+            attempt_started_at: time.monotonic() when the attempt started
+            events_sent: Number of events already handed to the formatter
+        """
+        partial_args = ""
+        if evidence.interrupted_tool is not None:
+            partial_args = (evidence.interrupted_tool.get("function") or {}).get("arguments") or ""
+        details = describe_stream_drop(self._current, error, attempt_started_at, events_sent)
+        message = (
+            f"[StreamRecovery] attempt={attempt} action={action.value} reason={reason} "
+            f"text_chars={len(evidence.text)} reasoning={evidence.reasoning_seen} "
+            f"tools_completed={len(evidence.completed_tools)} "
+            f"tools_interrupted={1 if evidence.interrupted_tool is not None else 0} "
+            f"partial_args_chars={len(partial_args)} backoff_ms={backoff_s * 1000:.0f} {details}"
+        )
+        if action == RecoveryAction.FAIL:
+            logger.error(message)
+        else:
+            logger.warning(message)
+
+    async def events(
+        self,
+        first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
+        enable_thinking_parser: bool = True,
+        outcome: Optional[StreamOutcome] = None,
+    ) -> AsyncGenerator[KiroEvent, None]:
+        """
+        Parse the attempts of this response as one continuous event stream.
+
+        Args:
+            first_token_timeout: First token wait timeout (seconds)
+            enable_thinking_parser: Whether to enable thinking block parsing
+            outcome: Optional side channel shared by all attempts (a local one is used when None)
+
+        Yields:
+            KiroEvent objects of all attempts, in order
+
+        Raises:
+            FirstTokenTimeoutError: The first attempt got no first chunk in time (not a drop)
+            UpstreamStreamInterrupted: The drop could not be recovered or recovery is exhausted
+        """
+        settings = self._settings
+        if outcome is None:
+            outcome = StreamOutcome()
+        budget = RecoveryBudget()
+        payload = settings.payload
+        attempt = 0
+        events_sent = 0
+        try:
+            while True:
+                evidence = AttemptEvidence()
+                attempt_started_at = time.monotonic()
+                try:
+                    if attempt > 0:
+                        self._current = await self._open_attempt(payload, first_token_timeout)
+                    inner = _parse_single_stream(
+                        self._current, first_token_timeout, enable_thinking_parser, outcome, evidence
+                    )
+                    try:
+                        async for event in inner:
+                            events_sent += 1
+                            yield event
+                    finally:
+                        await inner.aclose()
+                    return
+                except UPSTREAM_DROP_EXCEPTIONS as drop:
+                    error: BaseException = drop
+                except FirstTokenTimeoutError as timeout_error:
+                    if attempt == 0:
+                        raise
+                    raise UpstreamStreamInterrupted("continuation_failed") from timeout_error
+
+                decision = decide_recovery(evidence, budget, settings.max_attempts)
+                action = decision.action
+
+                if action == RecoveryAction.FINISH:
+                    self._log_decision(
+                        attempt + 1, action, decision.reason, evidence, 0.0, error,
+                        attempt_started_at, events_sent,
+                    )
+                    await self._close_current_quietly()
+                    for tool_call in deduplicate_tool_calls(evidence.completed_tools):
+                        tool_event = KiroEvent(type="tool_use", tool_use=tool_call)
+                        outcome.record_event(tool_event)
+                        yield tool_event
+                    outcome.finished = True
+                    return
+
+                if action == RecoveryAction.FAIL:
+                    self._log_decision(
+                        attempt + 1, action, decision.reason, evidence, 0.0, error,
+                        attempt_started_at, events_sent,
+                    )
+                    await self._close_current_quietly()
+                    raise UpstreamStreamInterrupted(decision.reason) from error
+
+                backoff_s = compute_backoff_s(budget.backoff_index(action))
+                self._log_decision(
+                    attempt + 1, action, decision.reason, evidence, backoff_s, error,
+                    attempt_started_at, events_sent,
+                )
+                budget.advance(action, evidence)
+                await self._close_current_quietly()
+                try:
+                    if action != RecoveryAction.RESEND:
+                        payload = build_continuation_payload(payload, action, evidence)
+                except ValueError as build_error:
+                    logger.error(f"[StreamRecovery] cannot build continuation request: {build_error}")
+                    raise UpstreamStreamInterrupted("payload_unsupported") from build_error
+                await backoff_sleep(backoff_s)
+                outcome.scanner.reset_tail()
+                attempt += 1
+        except (asyncio.CancelledError, GeneratorExit):
+            # Consumer went away: make sure the open upstream connection is released
+            await aclose_shielded(self._current.aclose)
+            raise
+
+
+def wrap_recoverable(
+    response: Any,
+    settings: Optional[RecoverySettings],
+    enabled: Optional[bool] = None,
+) -> Any:
+    """
+    Wrap an accepted upstream response in a recovery session when recovery applies.
+
+    Args:
+        response: Accepted (guarded) HTTP 200 response of the first attempt
+        settings: Recovery settings, or None when the caller does not support recovery
+        enabled: Override for UPSTREAM_DROP_RETRY (None reads the config value)
+
+    Returns:
+        A RecoverableResponse, or the response itself (settings is None, the switch is off,
+        or the response is already wrapped)
+    """
+    if settings is None or isinstance(response, RecoverableResponse):
+        return response
+    if enabled is None:
+        enabled = UPSTREAM_DROP_RETRY
+    if not enabled:
+        return response
+    return RecoverableResponse(response, settings)
+
+
+# ==================================================================================================
 # First Token Retry Logic
 # ==================================================================================================
 
@@ -772,6 +1302,8 @@ async def stream_with_first_token_retry(
     on_all_retries_failed: Optional[Callable[[int, float], Exception]] = None,
     emit_ready_marker: bool = False,
     empty_response_as_error: Optional[bool] = None,
+    is_preamble_chunk: Optional[Callable[[str], bool]] = None,
+    retry_upstream_drop: Optional[bool] = None,
 ) -> AsyncGenerator[Union[str, StreamReadyMarker], None]:
     """
     Generic streaming with automatic retry on first token timeout.
@@ -806,6 +1338,12 @@ async def stream_with_first_token_retry(
                           accepted and before the first SSE chunk. Routes use it (via
                           prime_sse_stream) to decide between an HTTP error and a stream.
         empty_response_as_error: Override for EMPTY_RESPONSE_AS_ERROR (None reads the config).
+        is_preamble_chunk: Optional predicate for SSE chunks that carry no model output (for
+                          example Anthropic message_start). They do not count as "output
+                          already sent" when deciding whether a dropped stream can be retried.
+        retry_upstream_drop: Override for UPSTREAM_DROP_RETRY (None reads the config). When
+                          on, a connection drop (see is_upstream_drop) before the client
+                          received any model output is retried like a first token timeout.
     
     Yields:
         Strings in SSE format (format depends on stream_processor), preceded by
@@ -828,13 +1366,17 @@ async def stream_with_first_token_retry(
     """
     last_error: Optional[Exception] = None
     ready_marker_sent = False
-    
+    if retry_upstream_drop is None:
+        retry_upstream_drop = UPSTREAM_DROP_RETRY
+    # Chunks with model output yielded to the client, across all attempts
+    client_visible_chunks = 0
     for attempt in range(max_retries):
         response: Optional[Union[httpx.Response, GuardedResponse]] = None
+        attempt_started_at = time.monotonic()
         try:
             # Make request
             if attempt > 0:
-                logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
+                logger.warning(f"Retry attempt {attempt + 1}/{max_retries}")
             
             # On first attempt, reuse initial_response if provided
             if attempt == 0 and initial_response is not None:
@@ -883,8 +1425,15 @@ async def stream_with_first_token_retry(
             
             # Try to stream with first token timeout
             async for chunk in stream_processor(response):
+                if is_preamble_chunk is None or not is_preamble_chunk(chunk):
+                    client_visible_chunks += 1
                 yield chunk
-            
+            # Per-stream timing summary (counts and timings only), used to tell an idle
+            # timeout from other causes when comparing streams that ended normally
+            logger.info(
+                f"[StreamStats] attempt={attempt + 1}/{max_retries} outcome=complete "
+                f"{describe_stream_drop(response, None, attempt_started_at, client_visible_chunks)}"
+            )
             # Successfully completed - exit
             return
             
@@ -905,6 +1454,15 @@ async def stream_with_first_token_retry(
             raise
 
         except FirstTokenTimeoutError as e:
+            if client_visible_chunks > 0:
+                # Restarting would append a second answer to the output the client already has
+                logger.error(
+                    f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} timed out after "
+                    f"client_chunks={client_visible_chunks} chunks were already sent: not retrying"
+                )
+                if response:
+                    await aclose_shielded(response.aclose)
+                raise
             last_error = e
             logger.warning(
                 f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
@@ -922,6 +1480,27 @@ async def stream_with_first_token_retry(
             continue
             
         except Exception as e:
+            if is_upstream_drop(e):
+                action = decide_drop_action(
+                    client_visible_chunks, retry_upstream_drop, attempt, max_retries
+                )
+                details = describe_stream_drop(response, e, attempt_started_at, client_visible_chunks)
+                if action == DROP_ACTION_RETRY:
+                    logger.warning(
+                        f"[StreamDrop] attempt={attempt + 1}/{max_retries} {details} "
+                        f"action={action}: upstream closed the connection before any output "
+                        f"was sent, retrying the original request"
+                    )
+                    last_error = e
+                    if response:
+                        try:
+                            await response.aclose()
+                        except (httpx.HTTPError, RuntimeError, OSError) as close_error:
+                            logger.debug(f"Error closing response: {close_error}")
+                    continue
+                logger.error(
+                    f"[StreamDrop] attempt={attempt + 1}/{max_retries} {details} action={action}"
+                )
             # Other errors - no retry, propagate
             # Use positional argument to avoid loguru interpreting curly braces in error message as format placeholders
             # f-string with repr() doesn't work because loguru still sees {type} inside the string

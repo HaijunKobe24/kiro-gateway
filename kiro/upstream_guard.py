@@ -42,6 +42,7 @@ This module contains:
 - GuardedResponse: response wrapper that replays the bytes consumed while peeking
 """
 
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -162,6 +163,16 @@ class UpstreamFrameScanner:
             self._scan_marker(data, tail_len, marker, key_prefix)
 
         self._tail = data[-CARRY_BYTES:]
+
+    def reset_tail(self) -> None:
+        """
+        Forget the carried bytes (call between two upstream attempts).
+
+        The counters stay, so one scanner can count the frames of several attempts of the
+        same client response. Without this, bytes of a truncated frame at the end of a
+        dropped attempt would be joined with the first bytes of the next attempt.
+        """
+        self._tail = b""
 
     def _scan_marker(self, data: bytes, tail_len: int, marker: bytes, key_prefix: str) -> None:
         """
@@ -338,6 +349,12 @@ class GuardedResponse:
     Attributes:
         first_chunk_ms: Time between the start of peeking and the first upstream chunk
         peeked_bytes: Number of bytes consumed while peeking
+        bytes_read: Bytes handed out by aiter_bytes() so far (peeked bytes included)
+        chunks_read: Chunks handed out by aiter_bytes() so far (peeked chunks included)
+        created_at: time.monotonic() when the wrapper was created (end of the peek phase)
+        last_chunk_at: time.monotonic() of the last chunk handed out (None before the first)
+        max_gap_s: Longest wait between two chunks handed out (the first gap is measured from
+            created_at, so peeked chunks replayed at once do not count as gaps)
     """
 
     def __init__(
@@ -352,6 +369,25 @@ class GuardedResponse:
         self._buffered = list(buffered)
         self.first_chunk_ms = first_chunk_ms
         self.peeked_bytes = sum(len(chunk) for chunk in self._buffered)
+        self.bytes_read = 0
+        self.chunks_read = 0
+        self.created_at = time.monotonic()
+        self.last_chunk_at: Optional[float] = None
+        self.max_gap_s = 0.0
+
+    def _record_chunk(self, chunk: bytes) -> None:
+        """
+        Update the read counters used to diagnose a mid-stream connection drop.
+
+        Args:
+            chunk: Chunk that is about to be handed to the consumer
+        """
+        now = time.monotonic()
+        previous = self.last_chunk_at if self.last_chunk_at is not None else self.created_at
+        self.max_gap_s = max(self.max_gap_s, now - previous)
+        self.bytes_read += len(chunk)
+        self.chunks_read += 1
+        self.last_chunk_at = now
 
     def __getattr__(self, name: str) -> Any:
         """Delegate unknown attributes to the wrapped response."""
@@ -368,8 +404,10 @@ class GuardedResponse:
             Raw bytes chunks in their original order and with their original boundaries
         """
         for chunk in self._buffered:
+            self._record_chunk(chunk)
             yield chunk
         async for chunk in self._iterator:
+            self._record_chunk(chunk)
             yield chunk
 
     async def aclose(self) -> None:

@@ -11,14 +11,29 @@ Tests for:
 - parse_kiro_stream() function
 - collect_stream_to_result() function
 - calculate_tokens_from_context_usage() function
+- upstream connection drop handling (is_upstream_drop, decide_drop_action,
+  describe_stream_drop, retry of a dropped stream before any output was sent)
 """
 
 import pytest
 import asyncio
+import time
+import httpx
+from loguru import logger
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import asdict
 
 from kiro.streaming_core import (
+    DROP_ACTION_DISABLED,
+    DROP_ACTION_EXHAUSTED,
+    DROP_ACTION_OUTPUT_SENT,
+    DROP_ACTION_RETRY,
+    STREAM_READY,
+    decide_drop_action,
+    describe_stream_drop,
+    format_response_summary,
+    is_upstream_drop,
+    log_response_summary,
     KiroEvent,
     NativeReasoningStats,
     StreamResult,
@@ -28,7 +43,9 @@ from kiro.streaming_core import (
     calculate_tokens_from_context_usage,
     stream_with_first_token_retry,
     _process_chunk,
+    _parse_single_stream,
 )
+from kiro.stream_recovery import AttemptEvidence
 
 
 # ==================================================================================================
@@ -3758,3 +3775,1757 @@ class TestCancellationCleanup:
         with pytest.raises(asyncio.CancelledError):
             await task
         await asyncio.wait_for(finished.wait(), timeout=2)
+
+
+# ==================================================================================================
+# Upstream connection drop (mid-stream) handling
+# ==================================================================================================
+
+DROP_MESSAGE = "peer closed connection without sending complete message body (incomplete chunked read)"
+
+
+def _drop_error():
+    """Builds the exception httpx raises when the upstream closes a chunked body early."""
+    return httpx.RemoteProtocolError(DROP_MESSAGE)
+
+
+def _ok_response():
+    """Response double with status 200 and a recordable aclose()."""
+    response = AsyncMock()
+    response.status_code = 200
+    response.aclose = AsyncMock()
+    return response
+
+
+def _capture_logs(level="WARNING"):
+    """Starts collecting loguru messages; returns (messages, handler id)."""
+    messages = []
+    handler_id = logger.add(lambda m: messages.append(str(m)), level=level, format="{level}|{message}")
+    return messages, handler_id
+
+
+class TestIsUpstreamDrop:
+    """Tests for is_upstream_drop()."""
+
+    def test_remote_protocol_error_is_a_drop(self):
+        """
+        What it does: Passes the exception seen in production ("incomplete chunked read").
+        Purpose: This is the failure the retry exists for.
+        """
+        assert is_upstream_drop(_drop_error()) is True
+
+    def test_read_error_is_a_drop(self):
+        """
+        What it does: Passes httpx.ReadError (connection reset while reading).
+        Purpose: A reset is the same failure class as an early close.
+        """
+        assert is_upstream_drop(httpx.ReadError("reset")) is True
+
+    @pytest.mark.parametrize("error", [
+        httpx.ReadTimeout("slow"),
+        httpx.ConnectError("refused"),
+        httpx.WriteError("broken pipe"),
+        RuntimeError("boom"),
+        ValueError("bad"),
+        asyncio.TimeoutError(),
+        FirstTokenTimeoutError("no token"),
+        Exception(DROP_MESSAGE),
+    ])
+    def test_other_exceptions_are_not_drops(self, error):
+        """
+        What it does: Passes timeouts, connect/write errors, generic errors and a plain
+        Exception that merely has the drop message text.
+        Purpose: Only the two httpx classes are retried; matching on message text is not done.
+        """
+        assert is_upstream_drop(error) is False
+
+
+class TestDecideDropAction:
+    """Tests for decide_drop_action()."""
+
+    def test_retries_when_nothing_was_sent(self):
+        """
+        What it does: No client output, switch on, attempts left.
+        Purpose: The only case that retries.
+        """
+        assert decide_drop_action(0, True, 0, 3) == DROP_ACTION_RETRY
+
+    def test_retries_on_second_attempt_too(self):
+        """
+        What it does: Second of three attempts failed.
+        Purpose: A third attempt is still available.
+        """
+        assert decide_drop_action(0, True, 1, 3) == DROP_ACTION_RETRY
+
+    def test_gives_up_on_last_attempt(self):
+        """
+        What it does: The last allowed attempt dropped.
+        Purpose: No attempt left, the drop is propagated.
+        """
+        assert decide_drop_action(0, True, 2, 3) == DROP_ACTION_EXHAUSTED
+
+    def test_single_attempt_budget_never_retries(self):
+        """
+        What it does: max_attempts=1.
+        Purpose: Boundary: the first attempt is also the last one.
+        """
+        assert decide_drop_action(0, True, 0, 1) == DROP_ACTION_EXHAUSTED
+
+    def test_output_already_sent_wins_over_everything(self):
+        """
+        What it does: One chunk with output was already yielded.
+        Purpose: A retry would append a second answer to the first one.
+        """
+        assert decide_drop_action(1, True, 0, 3) == DROP_ACTION_OUTPUT_SENT
+        assert decide_drop_action(500, False, 2, 3) == DROP_ACTION_OUTPUT_SENT
+
+    def test_disabled_switch_never_retries(self):
+        """
+        What it does: Switch off, nothing sent.
+        Purpose: Users can restore the old behavior.
+        """
+        assert decide_drop_action(0, False, 0, 3) == DROP_ACTION_DISABLED
+
+
+class TestDescribeStreamDrop:
+    """Tests for describe_stream_drop()."""
+
+    def test_uses_counters_of_guarded_response(self):
+        """
+        What it does: Describes a drop of a GuardedResponse that delivered 3 chunks / 300 bytes.
+        Purpose: Bytes, chunks and idle time are what tells idle timeouts from size limits.
+        """
+        from kiro.upstream_guard import GuardedResponse
+        guarded = GuardedResponse(MagicMock(), None, [])
+        guarded.bytes_read = 300
+        guarded.chunks_read = 3
+        guarded.last_chunk_at = time.monotonic() - 12.0
+        text = describe_stream_drop(guarded, _drop_error(), time.monotonic() - 20.0, 4)
+        print(text)
+        assert "error=RemoteProtocolError" in text
+        assert "bytes=300" in text
+        assert "chunks=3" in text
+        assert "client_chunks=4" in text
+        assert "idle=12." in text
+        assert "elapsed=20." in text
+
+    def test_reports_na_without_counters(self):
+        """
+        What it does: Describes a drop of a plain response double (guard disabled).
+        Purpose: Missing counters are shown as n/a, never as a crash or a bogus number.
+        """
+        text = describe_stream_drop(object(), httpx.ReadError("x"), time.monotonic(), 0)
+        assert "bytes=n/a" in text
+        assert "chunks=n/a" in text
+        assert "idle=n/a" in text
+        assert "error=ReadError" in text
+
+    def test_ignores_mock_attributes(self):
+        """
+        What it does: Passes an AsyncMock whose attributes are auto-created mocks.
+        Purpose: Non-numeric attributes must be treated as unknown.
+        """
+        text = describe_stream_drop(AsyncMock(), _drop_error(), time.monotonic(), 0)
+        assert "bytes=n/a" in text
+
+    def test_never_includes_the_error_message_text(self):
+        """
+        What it does: Describes an error whose message contains a secret.
+        Purpose: The line may carry counts and timings only.
+        """
+        text = describe_stream_drop(object(), httpx.ReadError("SECRET_PAYLOAD"), time.monotonic(), 0)
+        assert "SECRET_PAYLOAD" not in text
+
+
+class TestStreamWithFirstTokenRetryUpstreamDrop:
+    """stream_with_first_token_retry(): retry of a stream the upstream dropped."""
+
+    @staticmethod
+    async def _collect(**kwargs):
+        """Runs the core wrapper, returns (items, raised exception or None)."""
+        items = []
+        raised = None
+        kwargs.setdefault("empty_response_as_error", False)
+        try:
+            async for item in stream_with_first_token_retry(first_token_timeout=30, **kwargs):
+                items.append(item)
+        except Exception as e:
+            raised = e
+        return items, raised
+
+    @pytest.mark.asyncio
+    async def test_drop_before_any_output_is_retried(self):
+        """
+        What it does: Attempt 1 raises the drop error without yielding; attempt 2 works.
+        Purpose: The client only sees the answer of attempt 2 (the production failure).
+        """
+        calls = []
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            calls.append(response)
+            if len(calls) == 1:
+                raise _drop_error()
+            yield "chunk-a"
+            yield "chunk-b"
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+        )
+        assert raised is None
+        assert items == ["chunk-a", "chunk-b"]
+        assert len(calls) == 2
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_after_output_is_not_retried(self):
+        """
+        What it does: Attempt 1 yields one chunk, then drops.
+        Purpose: A retry would append a second answer; the error is propagated and the chunk
+        already delivered is not repeated.
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            yield "partial text"
+            raise _drop_error()
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+        )
+        assert items == ["partial text"]
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_preamble_chunk_does_not_block_retry(self):
+        """
+        What it does: Attempt 1 yields only a preamble chunk, then drops. Attempt 2 starts
+        with the same kind of preamble.
+        Purpose: is_preamble_chunk marks chunks without model output (Anthropic message_start).
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+        attempts = []
+
+        async def processor(response):
+            attempts.append(1)
+            if len(attempts) == 1:
+                yield "PREAMBLE"
+                raise _drop_error()
+            yield "text"
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            is_preamble_chunk=lambda c: c == "PREAMBLE",
+        )
+        assert raised is None
+        assert items == ["PREAMBLE", "text"]
+
+    @pytest.mark.asyncio
+    async def test_output_chunk_after_preamble_blocks_retry(self):
+        """
+        What it does: Preamble, then a content chunk, then a drop.
+        Purpose: Only chunks that are not preamble count as output.
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            yield "PREAMBLE"
+            yield "content"
+            raise _drop_error()
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            is_preamble_chunk=lambda c: c == "PREAMBLE",
+        )
+        assert items == ["PREAMBLE", "content"]
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_switch_off_restores_old_behavior(self):
+        """
+        What it does: retry_upstream_drop=False and a drop before any output.
+        Purpose: Opt-out: the error propagates after a single attempt.
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            raise _drop_error()
+            yield
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=False,
+        )
+        assert items == []
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_reads_config_when_override_is_none(self):
+        """
+        What it does: No override; UPSTREAM_DROP_RETRY patched to False, then to True.
+        Purpose: The default comes from the config switch.
+        """
+        async def processor(response):
+            raise _drop_error()
+            yield
+
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False):
+            make_request = AsyncMock(side_effect=lambda: _ok_response())
+            _, raised = await self._collect(
+                make_request=make_request, stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3,
+            )
+            assert make_request.await_count == 0
+            assert isinstance(raised, httpx.RemoteProtocolError)
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", True):
+            make_request = AsyncMock(side_effect=lambda: _ok_response())
+            _, raised = await self._collect(
+                make_request=make_request, stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3,
+            )
+            assert make_request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_attempts_dropping_raises_the_drop_error(self):
+        """
+        What it does: Every attempt drops before output; budget is 3.
+        Purpose: The real cause is raised (not a misleading first token timeout) and exactly
+        3 requests are made.
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            raise _drop_error()
+            yield
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+        )
+        assert items == []
+        assert isinstance(raised, httpx.RemoteProtocolError)
+        assert make_request.await_count == 2  # initial response + 2 retries = 3 attempts
+
+    @pytest.mark.asyncio
+    async def test_timeout_and_drop_share_the_attempt_budget(self):
+        """
+        What it does: Attempt 1 first token timeout, attempt 2 drop, attempt 3 success.
+        Purpose: Both failure kinds are retried and counted against the same budget.
+        """
+        responses = []
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+        async def processor(response):
+            responses.append(response)
+            if len(responses) == 1:
+                raise FirstTokenTimeoutError("slow")
+            if len(responses) == 2:
+                raise _drop_error()
+            yield "done"
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+        )
+        assert raised is None
+        assert items == ["done"]
+        assert make_request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_response_is_closed_before_retry(self):
+        """
+        What it does: Attempt 1 drops; its response must be closed.
+        Purpose: No leaked upstream connection (CLOSE_WAIT) on retry.
+        """
+        first = _ok_response()
+        second = _ok_response()
+        make_request = AsyncMock(return_value=second)
+        seen = []
+
+        async def processor(response):
+            seen.append(response)
+            if len(seen) == 1:
+                raise _drop_error()
+            yield "x"
+
+        await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=first, max_retries=3, retry_upstream_drop=True,
+        )
+        first.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ready_marker_is_sent_once_across_a_drop_retry(self):
+        """
+        What it does: emit_ready_marker=True; attempt 1 drops after the marker, attempt 2 works.
+        Purpose: The route consumes the marker once; a second one would reach the client.
+        """
+        make_request = AsyncMock(side_effect=lambda: _ok_response())
+        seen = []
+
+        async def processor(response):
+            seen.append(1)
+            if len(seen) == 1:
+                raise _drop_error()
+            yield "x"
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            emit_ready_marker=True, empty_response_as_error=False,
+        )
+        assert raised is None
+        assert items.count(STREAM_READY) == 1
+        assert items[-1] == "x"
+
+    @pytest.mark.asyncio
+    async def test_drop_inside_the_guard_peek_is_retried(self):
+        """
+        What it does: A real response double whose byte stream raises the drop error on the
+        first read, so the failure happens in guard_upstream_response.
+        Purpose: The production traceback shows drops during the peek phase as well.
+        """
+        def dropping():
+            response = _ok_response()
+
+            async def gen():
+                raise _drop_error()
+                yield b""
+
+            response.aiter_bytes = lambda *a, **k: gen()
+            return response
+
+        good = _ok_response()
+
+        async def good_gen():
+            yield b"abc"
+
+        good.aiter_bytes = lambda *a, **k: good_gen()
+        make_request = AsyncMock(return_value=good)
+
+        async def processor(response):
+            data = b"".join([c async for c in response.aiter_bytes()])
+            yield data.decode()
+
+        items, raised = await self._collect(
+            make_request=make_request, stream_processor=processor,
+            initial_response=dropping(), max_retries=3, retry_upstream_drop=True,
+            empty_response_as_error=True,
+        )
+        assert raised is None
+        assert items == ["abc"]
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_drop_errors_are_still_not_retried(self):
+        """
+        What it does: A RuntimeError and an httpx.ReadTimeout before any output.
+        Purpose: Only the drop classes are retried; everything else propagates immediately.
+        """
+        for error in (RuntimeError("boom"), httpx.ReadTimeout("slow")):
+            make_request = AsyncMock(side_effect=lambda: _ok_response())
+
+            async def processor(response, error=error):
+                raise error
+                yield
+
+            _, raised = await self._collect(
+                make_request=make_request, stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            )
+            assert raised is error
+            assert make_request.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_retry_logs_one_stream_drop_warning(self):
+        """
+        What it does: Drop before output, then success; captures the logs.
+        Purpose: A [StreamDrop] WARNING with action=retry explains the recovery, and no
+        "Unexpected error" ERROR is logged for a recovered drop.
+        """
+        messages, handler_id = _capture_logs("WARNING")
+        try:
+            make_request = AsyncMock(side_effect=lambda: _ok_response())
+            seen = []
+
+            async def processor(response):
+                seen.append(1)
+                if len(seen) == 1:
+                    raise _drop_error()
+                yield "x"
+
+            await self._collect(
+                make_request=make_request, stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            )
+        finally:
+            logger.remove(handler_id)
+        drop_lines = [m for m in messages if "[StreamDrop]" in m]
+        print(drop_lines)
+        assert len(drop_lines) == 1
+        assert drop_lines[0].startswith("WARNING|")
+        assert "action=retry" in drop_lines[0]
+        assert "attempt=1/3" in drop_lines[0]
+        assert not [m for m in messages if "Unexpected error during streaming" in m]
+
+    @pytest.mark.asyncio
+    async def test_give_up_after_output_logs_an_error_with_reason(self):
+        """
+        What it does: Drop after output; captures the logs.
+        Purpose: The [StreamDrop] ERROR says why no retry was made (output_sent) and carries
+        the counters, without leaking the message text of the exception.
+        """
+        messages, handler_id = _capture_logs("WARNING")
+        try:
+            async def processor(response):
+                yield "partial"
+                raise httpx.RemoteProtocolError("SECRET_PAYLOAD")
+
+            await self._collect(
+                make_request=AsyncMock(), stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3, retry_upstream_drop=True,
+            )
+        finally:
+            logger.remove(handler_id)
+        drop_lines = [m for m in messages if "[StreamDrop]" in m]
+        assert len(drop_lines) == 1
+        assert drop_lines[0].startswith("ERROR|")
+        assert f"action={DROP_ACTION_OUTPUT_SENT}" in drop_lines[0]
+        assert "client_chunks=1" in drop_lines[0]
+        assert "SECRET_PAYLOAD" not in drop_lines[0]
+
+
+class TestStreamStatsLogging:
+    """[StreamStats] summary for streams that complete normally."""
+
+    def test_describe_accepts_no_error(self):
+        """
+        What it does: describe_stream_drop with error=None and a max_gap_s counter.
+        Purpose: The same formatter serves completed streams.
+        """
+        from kiro.upstream_guard import GuardedResponse
+        guarded = GuardedResponse(MagicMock(), None, [])
+        guarded.max_gap_s = 7.25
+        text = describe_stream_drop(guarded, None, time.monotonic(), 3)
+        assert "error=none" in text
+        assert "max_gap=7.2s" in text or "max_gap=7.3s" in text
+
+    def test_describe_reports_na_max_gap_without_counter(self):
+        """
+        What it does: Plain object without max_gap_s.
+        Purpose: Unknown is shown as n/a.
+        """
+        assert "max_gap=n/a" in describe_stream_drop(object(), None, time.monotonic(), 0)
+
+    @pytest.mark.asyncio
+    async def test_completed_stream_logs_one_stats_line(self):
+        """
+        What it does: A normal stream through the retry wrapper.
+        Purpose: Exactly one INFO [StreamStats] line with outcome=complete.
+        """
+        messages, handler_id = _capture_logs("INFO")
+        try:
+            async def processor(response):
+                yield "a"
+            async for _ in stream_with_first_token_retry(
+                make_request=AsyncMock(), stream_processor=processor,
+                initial_response=_ok_response(), max_retries=3, first_token_timeout=30,
+                empty_response_as_error=False,
+            ):
+                pass
+        finally:
+            logger.remove(handler_id)
+        stats = [m for m in messages if "[StreamStats]" in m]
+        assert len(stats) == 1
+        assert stats[0].startswith("INFO|")
+        assert "outcome=complete" in stats[0]
+        assert "client_chunks=1" in stats[0]
+
+
+
+# ==================================================================================================
+# Attempt evidence capture (stream-drop recovery, _parse_single_stream)
+# ==================================================================================================
+
+async def _drain_with_evidence(response, evidence, **kwargs):
+    """Runs _parse_single_stream until it ends or raises; returns (events, exception or None)."""
+    events = []
+    error = None
+    try:
+        async for event in _parse_single_stream(
+            response, first_token_timeout=30, evidence=evidence, **kwargs
+        ):
+            events.append(event)
+    except Exception as exc:  # noqa: BLE001 - the test inspects any drop exception
+        error = exc
+    return events, error
+
+
+@pytest.mark.usefixtures("pinned_reasoning")
+class TestAttemptEvidenceCapture:
+    """_parse_single_stream fills AttemptEvidence on every way out; parse_kiro_stream is unchanged."""
+
+    @pytest.mark.asyncio
+    async def test_drop_after_text(self, aws_frames):
+        """
+        What it does: Text frames, then a RemoteProtocolError.
+        Goal: Evidence has the text, no tools, no reasoning, no metering; the drop propagates.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.content("Hello"), aws_frames.content(" world"), _drop_error(),
+        ])
+        events, error = await _drain_with_evidence(response, evidence)
+        assert isinstance(error, httpx.RemoteProtocolError)
+        assert [e.content for e in events] == ["Hello", " world"]
+        assert evidence.text == "Hello world"
+        assert evidence.reasoning_seen is False
+        assert evidence.completed_tools == [] and evidence.interrupted_tool is None
+        assert evidence.saw_metering is False
+
+    @pytest.mark.asyncio
+    async def test_drop_mid_tool_keeps_raw_partial_args_and_id(self, aws_frames):
+        """
+        What it does: Text, a tool start and two input fragments, then a drop.
+        Goal: interrupted_tool has the id, the name and the RAW partial arguments (not "{}").
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.content("Let me write it."),
+            aws_frames.tool_start("Write", "tooluse_1"),
+            aws_frames.tool_input('{"path": "/tmp/a", "content": "par', "Write", "tooluse_1"),
+            aws_frames.tool_input("tial", "Write", "tooluse_1"),
+            _drop_error(),
+        ])
+        events, error = await _drain_with_evidence(response, evidence)
+        assert isinstance(error, httpx.RemoteProtocolError)
+        assert [e.type for e in events] == ["content"]  # tool events are only yielded at the end
+        assert evidence.text == "Let me write it."
+        assert evidence.completed_tools == []
+        assert evidence.interrupted_tool["id"] == "tooluse_1"
+        assert evidence.interrupted_tool["function"]["name"] == "Write"
+        assert evidence.interrupted_tool["function"]["arguments"] == '{"path": "/tmp/a", "content": "partial'
+
+    @pytest.mark.asyncio
+    async def test_drop_after_complete_tool(self, aws_frames):
+        """
+        What it does: A tool with its stop frame, then a drop.
+        Goal: The tool is in completed_tools, nothing is interrupted.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.tool_start("Read", "t1"),
+            aws_frames.tool_input('{"path": "/x"}', "Read", "t1"),
+            aws_frames.tool_stop("Read", "t1"),
+            _drop_error(),
+        ])
+        _, error = await _drain_with_evidence(response, evidence)
+        assert isinstance(error, httpx.RemoteProtocolError)
+        assert [t["id"] for t in evidence.completed_tools] == ["t1"]
+        assert evidence.completed_tools[0]["function"]["arguments"] == '{"path": "/x"}'
+        assert evidence.interrupted_tool is None
+
+    @pytest.mark.asyncio
+    async def test_drop_with_complete_and_interrupted_tool(self, aws_frames):
+        """
+        What it does: One finished tool and a second one still streaming, then a drop.
+        Goal: Both are captured in their own field.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"a": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.tool_start("B", "t2"),
+            aws_frames.tool_input('{"b": [', "B", "t2"),
+            _drop_error(),
+        ])
+        await _drain_with_evidence(response, evidence)
+        assert [t["id"] for t in evidence.completed_tools] == ["t1"]
+        assert evidence.interrupted_tool["id"] == "t2"
+        assert evidence.interrupted_tool["function"]["arguments"] == '{"b": ['
+
+    @pytest.mark.asyncio
+    async def test_drop_after_reasoning_only(self, aws_frames):
+        """
+        What it does: Native reasoning frames, then a drop.
+        Goal: reasoning_seen is True, no text, no tools.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.reasoning("thinking"), aws_frames.reasoning(" more"), _drop_error(),
+        ])
+        events, error = await _drain_with_evidence(response, evidence)
+        assert isinstance(error, httpx.RemoteProtocolError)
+        assert [e.type for e in events] == ["thinking", "thinking"]
+        assert evidence.reasoning_seen is True
+        assert evidence.text == ""
+        assert not evidence.has_tools
+
+    @pytest.mark.asyncio
+    async def test_discarded_reasoning_still_counts_as_reasoning(self, aws_frames):
+        """
+        What it does: FAKE_REASONING_HANDLING=remove discards the reasoning events.
+        Goal: Nothing is yielded but the evidence still says reasoning was produced.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([aws_frames.reasoning("hidden"), _drop_error()])
+        with patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "remove"):
+            events, _ = await _drain_with_evidence(response, evidence)
+        assert events == []
+        assert evidence.reasoning_seen is True
+
+    @pytest.mark.asyncio
+    async def test_drop_before_any_output(self, aws_frames):
+        """
+        What it does: Only a contextUsageEvent arrives, then a drop.
+        Goal: Evidence stays empty (the resend row of the decision table).
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([aws_frames.context_usage(1.0), _drop_error()])
+        _, error = await _drain_with_evidence(response, evidence)
+        assert isinstance(error, httpx.RemoteProtocolError)
+        assert evidence == AttemptEvidence()
+
+    @pytest.mark.asyncio
+    async def test_metering_before_drop_is_recorded(self, aws_frames):
+        """
+        What it does: Text and a meteringEvent, then a drop.
+        Goal: saw_metering is True (the response was complete).
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.content("done"), aws_frames.metering(0.2), _drop_error(),
+        ])
+        await _drain_with_evidence(response, evidence)
+        assert evidence.saw_metering is True
+        assert evidence.text == "done"
+
+    @pytest.mark.asyncio
+    async def test_normal_end_leaves_consistent_evidence(self, aws_frames):
+        """
+        What it does: A complete stream with text, a finished tool and metering.
+        Goal: No exception; evidence matches what was yielded.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.content("Hi"),
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"a": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.metering(0.3),
+        ])
+        events, error = await _drain_with_evidence(response, evidence)
+        assert error is None
+        event_types = [e.type for e in events]
+        assert event_types[0] == "content"
+        assert event_types.count("tool_use") == 1
+        assert evidence.text == "Hi"
+        assert [t["id"] for t in evidence.completed_tools] == ["t1"]
+        assert evidence.interrupted_tool is None
+        assert evidence.saw_metering is True
+
+    @pytest.mark.asyncio
+    async def test_normal_end_with_unfinished_tool_is_finalized_not_interrupted(self, aws_frames):
+        """
+        What it does: Stream ends normally while a tool has no stop frame.
+        Goal: The parser finalizes it on the normal path, so it is completed, not interrupted.
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"a": 1}', "A", "t1"),
+        ])
+        _, error = await _drain_with_evidence(response, evidence)
+        assert error is None
+        assert [t["id"] for t in evidence.completed_tools] == ["t1"]
+        assert evidence.interrupted_tool is None
+
+    @pytest.mark.asyncio
+    async def test_first_token_timeout_leaves_empty_evidence(self):
+        """
+        What it does: The stream never produces a chunk.
+        Goal: FirstTokenTimeoutError propagates and the evidence stays empty.
+        """
+        evidence = AttemptEvidence()
+        events = []
+        with pytest.raises(FirstTokenTimeoutError):
+            async for event in _parse_single_stream(
+                _hanging_response(), first_token_timeout=0.05, evidence=evidence
+            ):
+                events.append(event)
+        assert evidence == AttemptEvidence()
+
+    @pytest.mark.asyncio
+    async def test_evidence_is_filled_when_the_consumer_closes_early(self, aws_frames):
+        """
+        What it does: The consumer stops after the first event and closes the generator.
+        Goal: The evidence reflects what was read so far (finally block runs).
+        """
+        evidence = AttemptEvidence()
+        response = _stream_response([
+            aws_frames.content("first"),
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"a', "A", "t1"),
+        ])
+        generator = _parse_single_stream(response, first_token_timeout=30, evidence=evidence)
+        first = await generator.__anext__()
+        assert first.content == "first"
+        await generator.aclose()
+        assert evidence.text == "first"
+
+    @pytest.mark.asyncio
+    async def test_utf8_text_split_across_chunks_is_complete_in_evidence(self, aws_frames):
+        """
+        What it does: Multi-byte text frame split into two network chunks, then a drop.
+        Goal: Evidence text is the full string.
+        """
+        frame = aws_frames.content("你好，世界")
+        mid = len(frame) - 12
+        evidence = AttemptEvidence()
+        await _drain_with_evidence(
+            _stream_response([frame[:mid], frame[mid:], _drop_error()]), evidence
+        )
+        assert evidence.text == "你好，世界"
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_matches_single_stream_for_plain_responses(self, aws_frames):
+        """
+        What it does: Runs parse_kiro_stream and _parse_single_stream on identical streams.
+        Goal: Same events: the dispatcher adds no behaviour for plain responses.
+        """
+        chunks = [aws_frames.content("A"), aws_frames.content("B"), aws_frames.metering(0.1)]
+        via_dispatcher = [e async for e in parse_kiro_stream(_stream_response(chunks), first_token_timeout=30)]
+        via_single = [e async for e in _parse_single_stream(_stream_response(chunks), first_token_timeout=30)]
+        assert via_dispatcher == via_single
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_closes_inner_generator_on_early_close(self, aws_frames):
+        """
+        What it does: Closes parse_kiro_stream after the first event.
+        Goal: The inner generator is finalized at once (its outcome is not marked finished).
+        """
+        outcome = StreamOutcome()
+        generator = parse_kiro_stream(
+            _stream_response([aws_frames.content("a"), aws_frames.content("b")]),
+            first_token_timeout=30,
+            outcome=outcome,
+        )
+        await generator.__anext__()
+        await generator.aclose()
+        assert outcome.finished is False
+
+    @pytest.mark.asyncio
+    async def test_no_content_in_logs(self, aws_frames):
+        """
+        What it does: Drops a stream that carried secret text and secret tool arguments.
+        Goal: Neither appears in WARNING+ or INFO logs emitted while capturing evidence.
+        """
+        messages, handler_id = _capture_logs(level="INFO")
+        try:
+            evidence = AttemptEvidence()
+            await _drain_with_evidence(_stream_response([
+                aws_frames.content(BODY_SECRET),
+                aws_frames.tool_start("A", "t1"),
+                aws_frames.tool_input('{"k": "' + THOUGHT_SECRET, "A", "t1"),
+                _drop_error(),
+            ]), evidence)
+        finally:
+            logger.remove(handler_id)
+        joined = "\n".join(messages)
+        assert BODY_SECRET not in joined
+        assert THOUGHT_SECRET not in joined
+
+
+# ==================================================================================================
+# Recovery session (RecoverableResponse, Kiro IDE parity)
+# ==================================================================================================
+
+from fastapi import HTTPException
+from kiro.stream_recovery import (
+    CONTINUE_PROMPT,
+    INTERRUPTED_TOOL_RESULT_MESSAGE,
+    RecoverySettings,
+    UpstreamStreamInterrupted,
+)
+from kiro.streaming_core import RecoverableResponse, wrap_recoverable
+
+PARTIAL_SECRET = "PARTIAL_ARGS_SECRET_91c2"
+
+
+def _base_payload():
+    """Minimal Kiro payload with one tool, history and a current user message."""
+    return {
+        "profileArn": "arn:test",
+        "conversationState": {
+            "conversationId": "conv-1",
+            "chatTriggerType": "MANUAL",
+            "history": [],
+            "currentMessage": {"userInputMessage": {
+                "content": "write the file",
+                "modelId": "claude-haiku-5.5",
+                "origin": "AI_EDITOR",
+                "userInputMessageContext": {"tools": [{"toolSpecification": {"name": "Write"}}]},
+            }},
+        },
+    }
+
+
+@pytest.fixture
+def recovery_env():
+    """Recovery switch on, empty guard on, fake reasoning off, backoff sleep patched (yielded)."""
+    sleep = AsyncMock()
+    with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", True), \
+            patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", True), \
+            patch("kiro.streaming_core.FAKE_REASONING_ENABLED", False), \
+            patch("kiro.streaming_core.FAKE_REASONING_HANDLING", "as_reasoning_content"), \
+            patch("kiro.streaming_core.backoff_sleep", sleep):
+        yield sleep
+
+
+def _session(first, *later, max_attempts=3):
+    """
+    Builds a RecoverableResponse over scripted attempts.
+
+    Args:
+        first: Chunks (bytes or exceptions) of the first attempt
+        later: Chunk lists of the following attempts (served by make_request, in order)
+        max_attempts: Attempt budget for plain resends
+
+    Returns:
+        (RecoverableResponse, make_request AsyncMock, first response double, later response doubles)
+    """
+    first_response = _stream_response(first)
+    later_responses = [_stream_response(chunks) for chunks in later]
+    make_request = AsyncMock(side_effect=later_responses)
+    settings = RecoverySettings(
+        payload=_base_payload(), make_request=make_request, max_attempts=max_attempts
+    )
+    return RecoverableResponse(first_response, settings), make_request, first_response, later_responses
+
+
+async def _run_session(session, outcome=None, first_token_timeout=5):
+    """Drains parse_kiro_stream(session); returns (events, raised exception or None)."""
+    events = []
+    raised = None
+    try:
+        async for event in parse_kiro_stream(
+            session, first_token_timeout=first_token_timeout, outcome=outcome
+        ):
+            events.append(event)
+    except Exception as exc:  # noqa: BLE001 - the test inspects the exception
+        raised = exc
+    return events, raised
+
+
+def _tool_frames(aws_frames, tool_id, name="Write", args='{"path": "/a", "content": "x"}', stop=True):
+    """Frames of one complete tool call."""
+    frames = [aws_frames.tool_start(name, tool_id), aws_frames.tool_input(args, name, tool_id)]
+    if stop:
+        frames.append(aws_frames.tool_stop(name, tool_id))
+    return frames
+
+
+class TestWrapRecoverable:
+    """wrap_recoverable() decides whether a response gets a recovery session."""
+
+    def test_no_settings_returns_response(self):
+        """
+        What it does: settings is None.
+        Goal: The response is returned unchanged.
+        """
+        response = _stream_response([])
+        assert wrap_recoverable(response, None) is response
+
+    def test_switch_off_returns_response(self):
+        """
+        What it does: UPSTREAM_DROP_RETRY is False.
+        Goal: The response is returned unchanged (old behavior).
+        """
+        response = _stream_response([])
+        settings = RecoverySettings(payload={}, make_request=AsyncMock())
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False):
+            assert wrap_recoverable(response, settings) is response
+
+    def test_switch_on_wraps(self):
+        """
+        What it does: Switch on and settings given.
+        Goal: A RecoverableResponse with status 200 and delegated attributes.
+        """
+        response = _stream_response([])
+        response.extra_attr = "x"
+        settings = RecoverySettings(payload={}, make_request=AsyncMock())
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", True):
+            wrapped = wrap_recoverable(response, settings)
+        assert isinstance(wrapped, RecoverableResponse)
+        assert wrapped.status_code == 200
+        assert wrapped.extra_attr == "x"
+
+    def test_explicit_enabled_overrides_config(self):
+        """
+        What it does: enabled=True while the config switch is off.
+        Goal: The override wins.
+        """
+        settings = RecoverySettings(payload={}, make_request=AsyncMock())
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False):
+            assert isinstance(wrap_recoverable(_stream_response([]), settings, enabled=True), RecoverableResponse)
+
+    def test_already_wrapped_is_not_wrapped_twice(self):
+        """
+        What it does: Wraps a RecoverableResponse again.
+        Goal: Same object back.
+        """
+        settings = RecoverySettings(payload={}, make_request=AsyncMock())
+        wrapped = RecoverableResponse(_stream_response([]), settings)
+        assert wrap_recoverable(wrapped, settings, enabled=True) is wrapped
+
+    @pytest.mark.asyncio
+    async def test_guard_passes_a_recoverable_response_through(self):
+        """
+        What it does: guard_upstream_response() on a RecoverableResponse.
+        Goal: Returned unchanged and nothing is read from it.
+        """
+        response = _stream_response([])
+        settings = RecoverySettings(payload={}, make_request=AsyncMock())
+        wrapped = RecoverableResponse(response, settings)
+        assert await guard_upstream_response(wrapped, first_token_timeout=5) is wrapped
+        assert response.pulled == []
+
+
+class TestRecoverableResponseRules:
+    """Decision rules 2-6 end to end through parse_kiro_stream()."""
+
+    @pytest.mark.asyncio
+    async def test_rule2_interrupted_tool_is_continued(self, aws_frames, recovery_env):
+        """
+        What it does: Text and a tool call still streaming, then a drop; the next attempt
+        re-issues the tool and ends normally.
+        Goal: One event stream: text, usage, the new tool call (tool calls come last). The second request carries the
+        partial assistant message and the failed tool result; the backoff is about 500 ms.
+        """
+        session, make_request, first, later = _session(
+            [aws_frames.content("Let me write it."),
+             aws_frames.tool_start("Write", "t1"),
+             aws_frames.tool_input('{"path": "/a", "content": "' + PARTIAL_SECRET, "Write", "t1"),
+             _drop_error()],
+            _tool_frames(aws_frames, "t2") + [aws_frames.metering(0.5)],
+        )
+        outcome = StreamOutcome()
+        events, raised = await _run_session(session, outcome)
+
+        assert raised is None
+        assert [e.type for e in events] == ["content", "usage", "tool_use"]
+        assert events[2].tool_use["id"] == "t2"
+        assert outcome.finished is True and outcome.produced_tool_use is True
+        make_request.assert_awaited_once()
+        sent = make_request.await_args.args[0]
+        history = sent["conversationState"]["history"]
+        assert history[-2]["userInputMessage"]["content"] == "write the file"
+        assistant = history[-1]["assistantResponseMessage"]
+        assert assistant["content"] == "Let me write it."
+        assert assistant["toolUses"][0]["toolUseId"] == "t1"
+        assert assistant["toolUses"][0]["input"] == {
+            "invalidArgs": '{"path": "/a", "content": "' + PARTIAL_SECRET
+        }
+        current = sent["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == ""
+        result = current["userInputMessageContext"]["toolResults"][0]
+        assert result["toolUseId"] == "t1" and result["status"] == "error"
+        assert result["content"] == [{"text": INTERRUPTED_TOOL_RESULT_MESSAGE}]
+        recovery_env.assert_awaited_once()
+        assert 0.4 <= recovery_env.await_args.args[0] <= 0.6
+        first.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rule3_drop_before_output_resends_the_same_payload(self, aws_frames, recovery_env):
+        """
+        What it does: Only a neutral frame, then a drop; the second attempt succeeds.
+        Goal: The request is the unchanged base payload object (identity kept).
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.context_usage(1.0), _drop_error()],
+            [aws_frames.content("Hello"), aws_frames.metering(0.1)],
+        )
+        events, raised = await _run_session(session)
+
+        assert raised is None
+        assert [e.content for e in events if e.type == "content"] == ["Hello"]
+        assert make_request.await_args.args[0] is session._settings.payload
+
+    @pytest.mark.asyncio
+    async def test_rule4_drop_after_text_resends_once_with_text(self, aws_frames, recovery_env):
+        """
+        What it does: Text, a drop, the second attempt streams more text and ends.
+        Goal: Both texts are forwarded as is; the request holds the partial text plus the
+        continue prompt and no tool results.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("The answer is"), _drop_error()],
+            [aws_frames.content("The answer is 42."), aws_frames.metering(0.1)],
+        )
+        events, raised = await _run_session(session)
+
+        assert raised is None
+        assert "".join(e.content for e in events if e.type == "content") == "The answer isThe answer is 42."
+        sent = make_request.await_args.args[0]
+        assert sent["conversationState"]["history"][-1]["assistantResponseMessage"] == {"content": "The answer is"}
+        current = sent["conversationState"]["currentMessage"]["userInputMessage"]
+        assert current["content"] == CONTINUE_PROMPT
+        assert "toolResults" not in current["userInputMessageContext"]
+
+    @pytest.mark.asyncio
+    async def test_rule4_second_text_drop_hits_the_duplication_cap(self, aws_frames, recovery_env):
+        """
+        What it does: Text drops twice.
+        Goal: One resend only, then UpstreamStreamInterrupted(duplication_cap).
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("a"), _drop_error()],
+            [aws_frames.content("b"), _drop_error()],
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "duplication_cap"
+        assert isinstance(raised.__cause__, httpx.RemoteProtocolError)
+        assert make_request.await_count == 1
+        assert [e.content for e in events] == ["a", "b"]
+
+    @pytest.mark.asyncio
+    async def test_rule5_reasoning_only_fails_without_a_request(self, aws_frames, recovery_env):
+        """
+        What it does: Native reasoning, then a drop.
+        Goal: UpstreamStreamInterrupted(reasoning_only), no new request, no sleep.
+        """
+        session, make_request, first, _ = _session(
+            [aws_frames.reasoning("thinking"), _drop_error()]
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "reasoning_only"
+        assert [e.type for e in events] == ["thinking"]
+        make_request.assert_not_awaited()
+        recovery_env.assert_not_awaited()
+        first.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rule6_complete_tool_then_drop_is_delivered(self, aws_frames, recovery_env):
+        """
+        What it does: Text, a complete tool call (stop frame), then a drop.
+        Goal: The tool call is yielded, the stream ends normally, no request, outcome finished.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("Reading.")] + _tool_frames(aws_frames, "t1", "Read", '{"path": "/x"}')
+            + [_drop_error()]
+        )
+        outcome = StreamOutcome()
+        events, raised = await _run_session(session, outcome)
+
+        assert raised is None
+        assert [e.type for e in events] == ["content", "tool_use"]
+        assert events[1].tool_use["id"] == "t1"
+        assert events[1].tool_use["function"]["arguments"] == '{"path": "/x"}'
+        assert outcome.finished is True and outcome.produced_tool_use is True
+        make_request.assert_not_awaited()
+        recovery_env.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_metering_seen_then_drop_finishes_without_resend(self, aws_frames, recovery_env):
+        """
+        What it does: Text and the meteringEvent arrive, then the connection drops.
+        Goal: The answer was complete: normal end, usage event kept, no request.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("Done."), aws_frames.metering(0.3), _drop_error()]
+        )
+        outcome = StreamOutcome()
+        events, raised = await _run_session(session, outcome)
+
+        assert raised is None
+        assert [e.type for e in events] == ["content", "usage"]
+        assert outcome.finished is True
+        make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_normal_stream_needs_no_recovery(self, aws_frames, recovery_env):
+        """
+        What it does: A stream that ends normally.
+        Goal: Same events as a plain response, no request, no sleep.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("Hi"), aws_frames.metering(0.1)]
+        )
+        events, raised = await _run_session(session)
+
+        assert raised is None
+        assert [e.type for e in events] == ["content", "usage"]
+        make_request.assert_not_awaited()
+        recovery_env.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_drop_error_propagates(self, aws_frames, recovery_env):
+        """
+        What it does: The stream raises a ValueError.
+        Goal: Not a drop: it propagates unchanged and nothing is requested.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.content("a"), ValueError("boom")]
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, ValueError)
+        make_request.assert_not_awaited()
+
+
+class TestRecoverableResponseBoundaries:
+    """Caps, drops during a continuation, failing continuation requests, cleanup."""
+
+    @pytest.mark.asyncio
+    async def test_tool_recovery_cap_of_three(self, aws_frames, recovery_env):
+        """
+        What it does: Four consecutive attempts drop mid tool call.
+        Goal: Three continuations, then UpstreamStreamInterrupted(streak_exhausted); the third
+        request builds on the second (history grows by two entries per recovery).
+        """
+        def dropping(tool_id):
+            return [aws_frames.tool_start("Write", tool_id),
+                    aws_frames.tool_input('{"p": "', "Write", tool_id), _drop_error()]
+
+        session, make_request, _, _ = _session(
+            dropping("t1"), dropping("t2"), dropping("t3"), dropping("t4")
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "streak_exhausted"
+        assert make_request.await_count == 3
+        assert recovery_env.await_count == 3
+        third = make_request.await_args_list[2].args[0]
+        assert len(third["conversationState"]["history"]) == 6
+
+    @pytest.mark.asyncio
+    async def test_drop_during_continuation_without_output_fails(self, aws_frames, recovery_env):
+        """
+        What it does: Attempt 1 drops mid tool; the continuation drops before any frame.
+        Goal: A tool was involved earlier, so no plain resend: reason tool_context.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), aws_frames.tool_input('{"a"', "Write", "t1"), _drop_error()],
+            [_drop_error()],
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "tool_context"
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_during_continuation_after_text_fails(self, aws_frames, recovery_env):
+        """
+        What it does: The continuation streams text, then drops.
+        Goal: tool_context again: the new text stays with the client, no further request.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), aws_frames.tool_input('{"a"', "Write", "t1"), _drop_error()],
+            [aws_frames.content("partial"), _drop_error()],
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "tool_context"
+        assert [e.content for e in events] == ["partial"]
+        assert make_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_during_continuation_after_complete_tool_finishes(self, aws_frames, recovery_env):
+        """
+        What it does: The continuation emits a complete tool call, then drops.
+        Goal: Rule 6 applies inside the continuation: the tool call is delivered.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), aws_frames.tool_input('{"a"', "Write", "t1"), _drop_error()],
+            _tool_frames(aws_frames, "t2") + [_drop_error()],
+        )
+        outcome = StreamOutcome()
+        events, raised = await _run_session(session, outcome)
+
+        assert raised is None
+        assert [e.tool_use["id"] for e in events if e.type == "tool_use"] == ["t2"]
+        assert outcome.finished is True
+
+    @pytest.mark.asyncio
+    async def test_plain_resends_stop_at_the_attempt_budget(self, aws_frames, recovery_env):
+        """
+        What it does: Every attempt drops before output, budget 3.
+        Goal: Two resends, then attempts_exhausted (3 attempts in total).
+        """
+        session, make_request, _, _ = _session(
+            [_drop_error()], [_drop_error()], [_drop_error()], max_attempts=3
+        )
+        events, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "attempts_exhausted"
+        assert make_request.await_count == 2
+        assert [call.args[0] for call in recovery_env.await_args_list] != []
+        delays = [call.args[0] for call in recovery_env.await_args_list]
+        assert 0.4 <= delays[0] <= 0.6 and 0.8 <= delays[1] <= 1.2
+
+    @pytest.mark.asyncio
+    async def test_budget_of_one_attempt_never_resends(self, aws_frames, recovery_env):
+        """
+        What it does: max_attempts=1 and a drop before output.
+        Goal: attempts_exhausted at once, no request.
+        """
+        session, make_request, _, _ = _session([_drop_error()], max_attempts=1)
+        _, raised = await _run_session(session)
+
+        assert raised.reason == "attempts_exhausted"
+        make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_continuation_http_error_status_fails(self, aws_frames, recovery_env):
+        """
+        What it does: The continuation request answers HTTP 400.
+        Goal: UpstreamStreamInterrupted(continuation_failed); the rejected response is closed.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), _drop_error()]
+        )
+        rejected = _ok_response()
+        rejected.status_code = 400
+        make_request.side_effect = [rejected]
+        _, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "continuation_failed"
+        rejected.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [
+        httpx.ConnectError("no route"),
+        HTTPException(status_code=502, detail="bad gateway"),
+        OSError("socket"),
+    ])
+    async def test_continuation_request_error_fails(self, aws_frames, recovery_env, error):
+        """
+        What it does: make_request itself raises.
+        Goal: UpstreamStreamInterrupted(continuation_failed) with the error as the cause.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), _drop_error()]
+        )
+        make_request.side_effect = error
+        _, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "continuation_failed"
+        assert raised.__cause__ is error
+
+    @pytest.mark.asyncio
+    async def test_continuation_first_token_timeout_fails(self, aws_frames, recovery_env):
+        """
+        What it does: The continuation never sends a first chunk.
+        Goal: UpstreamStreamInterrupted(continuation_failed), the hanging response is closed.
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), _drop_error()]
+        )
+        hanging = _hanging_response()
+        make_request.side_effect = [hanging]
+        _, raised = await _run_session(session, first_token_timeout=0.05)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "continuation_failed"
+        hanging.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_continuation_empty_response_fails(self, aws_frames, recovery_env):
+        """
+        What it does: The continuation returns an empty (neutral frames only) response.
+        Goal: UpstreamStreamInterrupted(continuation_failed).
+        """
+        session, make_request, _, _ = _session(
+            [aws_frames.tool_start("Write", "t1"), _drop_error()],
+            [aws_frames.context_usage(1.0)],
+        )
+        _, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "continuation_failed"
+
+    @pytest.mark.asyncio
+    async def test_drop_while_peeking_the_continuation_is_decided(self, aws_frames, recovery_env):
+        """
+        What it does: After a plain resend, the new stream drops before its first frame.
+        Goal: The drop is decided like any other (another resend), the third attempt succeeds.
+        """
+        session, make_request, _, later = _session(
+            [_drop_error()], [_drop_error()], [aws_frames.content("ok"), aws_frames.metering(0.1)],
+            max_attempts=4,
+        )
+        events, raised = await _run_session(session)
+
+        assert raised is None
+        assert [e.content for e in events if e.type == "content"] == ["ok"]
+        assert make_request.await_count == 2
+        later[0].aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_first_token_timeout_propagates(self, aws_frames, recovery_env):
+        """
+        What it does: The first attempt is not guarded and never answers.
+        Goal: FirstTokenTimeoutError propagates unchanged (the core retry handles it).
+        """
+        settings = RecoverySettings(payload=_base_payload(), make_request=AsyncMock())
+        session = RecoverableResponse(_hanging_response(), settings)
+        _, raised = await _run_session(session, first_token_timeout=0.05)
+
+        assert isinstance(raised, FirstTokenTimeoutError)
+        settings.make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_consumer_close_closes_the_open_response(self, aws_frames, recovery_env):
+        """
+        What it does: The consumer closes the generator after the first event of a continuation.
+        Goal: The continuation's response is closed (no leaked upstream connection).
+        """
+        session, make_request, _, later = _session(
+            [aws_frames.tool_start("Write", "t1"), _drop_error()],
+            [aws_frames.content("a"), aws_frames.content("b"), aws_frames.metering(0.1)],
+        )
+        generator = parse_kiro_stream(session, first_token_timeout=5)
+        first_event = await generator.__anext__()
+        await generator.aclose()
+
+        assert first_event.content == "a"
+        later[0].aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scanner_tail_is_reset_between_attempts(self, aws_frames, recovery_env):
+        """
+        What it does: Attempt 1 ends inside a frame header name; attempt 2 starts with the
+        rest of that name (the worst case for joined bytes).
+        Goal: The shared scanner does not count the joined header, and it keeps the counters
+        of attempt 1 (without reset_tail the count would be 3).
+        """
+        frame = aws_frames.content("cut")
+        cut = frame.index(b"assistantResponseEvent") + 5
+        session, make_request, _, _ = _session(
+            [aws_frames.content("a"), frame[:cut], _drop_error()],
+            [frame[cut:], aws_frames.content("b"), aws_frames.metering(0.1)],
+        )
+        outcome = StreamOutcome()
+        await _run_session(session, outcome)
+
+        assert outcome.scanner.counts["assistantResponseEvent"] == 2
+        assert outcome.scanner.counts["meteringEvent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_logs_hold_counts_only(self, aws_frames, recovery_env):
+        """
+        What it does: Recovers a drop whose partial arguments and text are secrets.
+        Goal: A [StreamRecovery] line with counts exists; no content in any log line.
+        """
+        messages, handler_id = _capture_logs(level="DEBUG")
+        try:
+            session, _, _, _ = _session(
+                [aws_frames.content(BODY_SECRET),
+                 aws_frames.tool_start("Write", "t1"),
+                 aws_frames.tool_input('{"k": "' + PARTIAL_SECRET, "Write", "t1"),
+                 _drop_error()],
+                _tool_frames(aws_frames, "t2") + [aws_frames.metering(0.1)],
+            )
+            await _run_session(session)
+        finally:
+            logger.remove(handler_id)
+        joined = "\n".join(messages)
+        recovery_lines = [m for m in messages if "[StreamRecovery]" in m]
+        assert len(recovery_lines) == 1
+        assert "action=continue_tools" in recovery_lines[0]
+        assert "tools_interrupted=1" in recovery_lines[0]
+        assert f"text_chars={len(BODY_SECRET)}" in recovery_lines[0]
+        assert BODY_SECRET not in joined
+        assert PARTIAL_SECRET not in joined
+
+    @pytest.mark.asyncio
+    async def test_give_up_is_logged_as_error(self, aws_frames, recovery_env):
+        """
+        What it does: A reasoning-only drop.
+        Goal: The [StreamRecovery] line is ERROR level and names action=fail and the reason.
+        """
+        messages, handler_id = _capture_logs(level="WARNING")
+        try:
+            session, _, _, _ = _session([aws_frames.reasoning("r"), _drop_error()])
+            await _run_session(session)
+        finally:
+            logger.remove(handler_id)
+        lines = [m for m in messages if "[StreamRecovery]" in m]
+        assert len(lines) == 1
+        assert lines[0].startswith("ERROR|")
+        assert "action=fail" in lines[0] and "reason=reasoning_only" in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_unbuildable_continuation_fails(self, aws_frames, recovery_env):
+        """
+        What it does: The base payload has no current message.
+        Goal: UpstreamStreamInterrupted(payload_unsupported) instead of a crash.
+        """
+        settings = RecoverySettings(payload={"conversationState": {}}, make_request=AsyncMock())
+        session = RecoverableResponse(
+            _stream_response([aws_frames.tool_start("Write", "t1"), _drop_error()]), settings
+        )
+        _, raised = await _run_session(session)
+
+        assert isinstance(raised, UpstreamStreamInterrupted)
+        assert raised.reason == "payload_unsupported"
+
+
+class TestCollectStreamToResultRecovery:
+    """collect_stream_to_result(recovery=...) recovers invisibly (non-streaming)."""
+
+    @pytest.mark.asyncio
+    async def test_interrupted_tool_is_recovered_invisibly(self, aws_frames, recovery_env):
+        """
+        What it does: Text and a half tool call, a drop, then a continuation with the full tool.
+        Goal: One StreamResult with the text, exactly one tool call (the re-issued one), usage.
+        """
+        make_request = AsyncMock(return_value=_stream_response(
+            _tool_frames(aws_frames, "t2") + [aws_frames.metering(0.5)]
+        ))
+        settings = RecoverySettings(payload=_base_payload(), make_request=make_request)
+        response = _stream_response([
+            aws_frames.content("Writing."),
+            aws_frames.tool_start("Write", "t1"),
+            aws_frames.tool_input('{"p', "Write", "t1"),
+            _drop_error(),
+        ])
+        result = await collect_stream_to_result(response, first_token_timeout=5, recovery=settings)
+
+        assert result.content == "Writing."
+        assert [t["id"] for t in result.tool_calls] == ["t2"]
+        assert result.usage == 0.5
+
+    @pytest.mark.asyncio
+    async def test_give_up_raises(self, aws_frames, recovery_env):
+        """
+        What it does: Reasoning-only drop.
+        Goal: UpstreamStreamInterrupted propagates to the caller.
+        """
+        settings = RecoverySettings(payload=_base_payload(), make_request=AsyncMock())
+        response = _stream_response([aws_frames.reasoning("r"), _drop_error()])
+        with pytest.raises(UpstreamStreamInterrupted) as info:
+            await collect_stream_to_result(response, first_token_timeout=5, recovery=settings)
+
+        assert info.value.reason == "reasoning_only"
+
+    @pytest.mark.asyncio
+    async def test_complete_tool_then_drop_returns_the_tool(self, aws_frames, recovery_env):
+        """
+        What it does: A complete tool call, then a drop.
+        Goal: The result holds the tool call; no request was made.
+        """
+        make_request = AsyncMock()
+        settings = RecoverySettings(payload=_base_payload(), make_request=make_request)
+        response = _stream_response(_tool_frames(aws_frames, "t1") + [_drop_error()])
+        result = await collect_stream_to_result(response, first_token_timeout=5, recovery=settings)
+
+        assert [t["id"] for t in result.tool_calls] == ["t1"]
+        make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_switch_off_keeps_the_old_behavior(self, aws_frames, recovery_env):
+        """
+        What it does: UPSTREAM_DROP_RETRY False and a drop.
+        Goal: The raw httpx error propagates, no request.
+        """
+        make_request = AsyncMock()
+        settings = RecoverySettings(payload=_base_payload(), make_request=make_request)
+        response = _stream_response([aws_frames.content("a"), _drop_error()])
+        with patch("kiro.streaming_core.UPSTREAM_DROP_RETRY", False):
+            with pytest.raises(httpx.RemoteProtocolError):
+                await collect_stream_to_result(response, first_token_timeout=5, recovery=settings)
+
+        make_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_argument_keeps_the_old_behavior(self, aws_frames, recovery_env):
+        """
+        What it does: No recovery settings at all.
+        Goal: The raw httpx error propagates (existing callers are unchanged).
+        """
+        response = _stream_response([aws_frames.content("a"), _drop_error()])
+        with pytest.raises(httpx.RemoteProtocolError):
+            await collect_stream_to_result(response, first_token_timeout=5)
+
+
+class TestFirstTokenTimeoutAfterOutput:
+    """stream_with_first_token_retry() must not restart a request after client-visible output."""
+
+    @staticmethod
+    def _processor_raising_after(chunks):
+        """Stream processor that yields chunks and then raises FirstTokenTimeoutError."""
+        async def processor(response):
+            for chunk in chunks:
+                yield chunk
+            raise FirstTokenTimeoutError("late")
+        return processor
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_output_is_not_retried(self, aws_frames):
+        """
+        What it does: One chunk reaches the client, then a FirstTokenTimeoutError.
+        Goal: It propagates, make_request is never called, the response is closed.
+        """
+        make_request = AsyncMock()
+        response = _ok_response()
+        received = []
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            with pytest.raises(FirstTokenTimeoutError):
+                async for chunk in stream_with_first_token_retry(
+                    make_request, self._processor_raising_after(["data: a\n\n"]),
+                    initial_response=response, max_retries=3, first_token_timeout=5,
+                ):
+                    received.append(chunk)
+
+        assert received == ["data: a\n\n"]
+        make_request.assert_not_awaited()
+        response.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_timeout_before_output_is_still_retried(self, aws_frames):
+        """
+        What it does: The first attempt times out without output, the second succeeds.
+        Goal: Old behavior kept: one new request, the client gets the second answer.
+        """
+        make_request = AsyncMock(return_value=_ok_response())
+        calls = {"n": 0}
+
+        async def processor(response):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FirstTokenTimeoutError("early")
+            yield "data: ok\n\n"
+
+        received = []
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            async for chunk in stream_with_first_token_retry(
+                make_request, processor, initial_response=_ok_response(),
+                max_retries=3, first_token_timeout=5,
+            ):
+                received.append(chunk)
+
+        assert received == ["data: ok\n\n"]
+        make_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_preamble_only_output_still_counts_as_no_output(self, aws_frames):
+        """
+        What it does: Only a preamble chunk (is_preamble_chunk) was sent before the timeout.
+        Goal: A preamble carries no model output, so the retry is still allowed.
+        """
+        make_request = AsyncMock(return_value=_ok_response())
+        calls = {"n": 0}
+
+        async def processor(response):
+            calls["n"] += 1
+            yield "event: message_start\n\n"
+            if calls["n"] == 1:
+                raise FirstTokenTimeoutError("early")
+            yield "data: ok\n\n"
+
+        received = []
+        with patch("kiro.streaming_core.EMPTY_RESPONSE_AS_ERROR", False):
+            async for chunk in stream_with_first_token_retry(
+                make_request, processor, initial_response=_ok_response(),
+                max_retries=3, first_token_timeout=5,
+                is_preamble_chunk=lambda c: c.startswith("event: message_start"),
+            ):
+                received.append(chunk)
+
+        assert received[-1] == "data: ok\n\n"
+        make_request.assert_awaited_once()
+
+
+class TestResponseSummary:
+    """format_response_summary() / log_response_summary(): one-line fingerprint of a response."""
+
+    def test_normal_text_response(self):
+        """
+        What it does: Text and reasoning, no tools, metering seen.
+        Purpose: All fields are present and the response is not empty.
+        """
+        text = format_response_summary("openai", "claude-sonnet-5.5", "stop", 120, 30, [], 0, True)
+        assert text == (
+            "api=openai model=claude-sonnet-5.5 finish=stop text_chars=120 reasoning_chars=30 "
+            "tool_calls=0[] truncated_tools=0 metering=true empty=false"
+        )
+
+    def test_empty_response_is_flagged(self):
+        """
+        What it does: No text, no reasoning, no tool call.
+        Purpose: This is the case the line exists to reveal: empty=true.
+        """
+        text = format_response_summary("anthropic", "m", "end_turn", 0, 0, [], 0, True)
+        assert "empty=true" in text
+        assert "tool_calls=0[]" in text
+
+    def test_reasoning_only_is_not_empty(self):
+        """
+        What it does: Only reasoning text.
+        Purpose: Reasoning counts as output for the empty flag.
+        """
+        assert "empty=false" in format_response_summary("openai", "m", "stop", 0, 5, [], 0, True)
+
+    def test_tool_call_only_is_not_empty(self):
+        """
+        What it does: One tool call, no text.
+        Purpose: A pure tool call is a normal agent step, not an empty answer.
+        """
+        text = format_response_summary("openai", "m", "tool_calls", 0, 0, ["Write"], 0, True)
+        assert "empty=false" in text
+        assert "tool_calls=1[Write]" in text
+
+    def test_tool_names_are_shortened_cleaned_and_limited(self):
+        """
+        What it does: 7 tools, one with whitespace and braces, one very long.
+        Purpose: The line stays short and single-line: max 5 names, 40 chars each, "+N" for the rest.
+        """
+        names = ["a b\nc", "{x}", "L" * 100, "d", "e", "f", "g"]
+        text = format_response_summary("openai", "m", "tool_calls", 1, 0, names, 0, True)
+        assert "\n" not in text
+        assert "tool_calls=7[abc,{x}," + "L" * 40 + ",d,e,+2]" in text
+
+    def test_missing_metering_and_truncation_are_reported(self):
+        """
+        What it does: Truncated tool and no metering signal.
+        Purpose: Both facts are visible in the line.
+        """
+        text = format_response_summary("openai", "m", "length", 10, 0, ["Write"], 1, False)
+        assert "truncated_tools=1" in text
+        assert "metering=false" in text
+
+    def test_log_writes_one_info_line_with_tag(self):
+        """
+        What it does: log_response_summary with braces in a tool name and model.
+        Purpose: One INFO [ResponseSummary] line; braces do not break loguru formatting;
+        no message content is possible because none is passed in.
+        """
+        messages, handler_id = _capture_logs("INFO")
+        try:
+            log_response_summary("openai", "m{0}", "tool_calls", 5, 0, ["t{1}"], 0, True)
+        finally:
+            logger.remove(handler_id)
+        lines = [m for m in messages if "[ResponseSummary]" in m]
+        assert len(lines) == 1
+        assert lines[0].startswith("INFO|")
+        assert "model=m{0}" in lines[0]
+        assert "tool_calls=1[t{1}]" in lines[0]

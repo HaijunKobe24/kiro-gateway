@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro import empty_response
 from kiro.empty_response import (
     EMPTY_RESPONSE_MESSAGE,
     INCOMPLETE_RESPONSE_MESSAGE,
@@ -21,6 +22,8 @@ from kiro.empty_response import (
     build_empty_response_context,
     build_incomplete_stream_error_anthropic,
     build_incomplete_stream_error_openai,
+    build_stream_interrupted_error_anthropic,
+    build_stream_interrupted_error_openai,
     handle_empty_response_anthropic,
     handle_empty_response_openai,
     log_incomplete_stream,
@@ -521,3 +524,104 @@ class TestLogIncompleteStream:
         """
         with patch("kiro.empty_response.debug_logger", None):
             log_incomplete_stream(self._outcome(aws_frames), "m")
+
+
+class TestStreamInterruptedErrors:
+    """In-stream errors for a mid-stream upstream drop that could not be recovered."""
+
+    def test_anthropic_event_shape(self):
+        """
+        What it does: Builds the Anthropic error event.
+        Purpose: "event: error" with the Kiro message and the incomplete-response error type.
+        """
+        text = build_stream_interrupted_error_anthropic()
+        assert text.startswith("event: error\ndata: ") and text.endswith("\n\n")
+        data = json.loads(text.split("data: ", 1)[1])
+        assert data["type"] == "error"
+        assert data["error"]["message"] == "Your connection was interrupted. Please try again in a moment."
+        assert data["error"]["type"] == empty_response.INCOMPLETE_RESPONSE_ERROR_TYPE
+
+    def test_openai_chunk_shape(self):
+        """
+        What it does: Builds the OpenAI error chunk.
+        Purpose: A data line with a truthy "error" key, server_error type, own code.
+        """
+        text = build_stream_interrupted_error_openai()
+        assert text.startswith("data: {") and text.endswith("\n\n")
+        error = json.loads(text[len("data: "):])["error"]
+        assert error["message"] == "Your connection was interrupted. Please try again in a moment."
+        assert error["type"] == "server_error"
+        assert error["code"] == "upstream_stream_interrupted"
+
+    def test_builders_are_distinct_from_incomplete_response_errors(self):
+        """
+        What it does: Compares with the incomplete-response builders.
+        Purpose: Different message, so clients and logs can tell the causes apart.
+        """
+        assert build_stream_interrupted_error_openai() != build_incomplete_stream_error_openai()
+        assert build_stream_interrupted_error_anthropic() != build_incomplete_stream_error_anthropic()
+
+
+class TestStreamInterruptedHttpResponses:
+    """HTTP 502 responses of non-streaming requests whose mid-stream drop recovery gave up."""
+
+    def test_openai_response_shape_and_log(self, loguru_messages):
+        """
+        What it does: Builds the OpenAI 502 for a give-up and reads the log.
+        Purpose: Kiro message, server_error type, own code, retry hint; the log carries only
+        model and reason.
+        """
+        from kiro.stream_recovery import UpstreamStreamInterrupted
+        exc = UpstreamStreamInterrupted("reasoning_only")
+
+        response = empty_response.handle_stream_interrupted_openai(exc, "claude-sonnet-4-5")
+
+        assert response.status_code == 502
+        assert json.loads(response.body) == {
+            "error": {
+                "message": "Your connection was interrupted. Please try again in a moment.",
+                "type": "server_error",
+                "param": None,
+                "code": "upstream_stream_interrupted",
+            }
+        }
+        assert response.headers["x-should-retry"] == "true"
+        lines = [m for m in loguru_messages if "recovery gave up" in m]
+        assert len(lines) == 1
+        assert lines[0].startswith("WARNING|")
+        assert "model=claude-sonnet-4-5" in lines[0] and "reason=reasoning_only" in lines[0]
+
+    def test_anthropic_response_shape(self):
+        """
+        What it does: Builds the Anthropic 502 for a give-up.
+        Purpose: Anthropic error envelope with api_error and the Kiro message.
+        """
+        from kiro.stream_recovery import UpstreamStreamInterrupted
+
+        response = empty_response.handle_stream_interrupted_anthropic(
+            UpstreamStreamInterrupted("streak_exhausted"), "claude-sonnet-4-5"
+        )
+
+        assert response.status_code == 502
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Your connection was interrupted. Please try again in a moment.",
+            },
+        }
+        assert response.headers["x-should-retry"] == "true"
+
+    def test_debug_logs_are_flushed_on_give_up(self):
+        """
+        What it does: Gives up with a debug_logger present.
+        Purpose: "errors" debug mode keeps the logs of the failed request.
+        """
+        from kiro.stream_recovery import UpstreamStreamInterrupted
+        fake_logger = MagicMock()
+
+        with patch.object(empty_response, "debug_logger", fake_logger):
+            empty_response.handle_stream_interrupted_openai(UpstreamStreamInterrupted("x"), "m")
+
+        fake_logger.flush_on_error.assert_called_once()
+        assert fake_logger.flush_on_error.call_args.args[0] == 502

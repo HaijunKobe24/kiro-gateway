@@ -1905,3 +1905,160 @@ class TestAwsEventStreamParserReasoningEdgeCases:
             + ["context_usage", "usage"]
         )
         assert events[-1] == {"type": "usage", "data": 0.7}
+
+
+# =============================================================================
+# pending_tool_state (non-finalizing tool state for stream-drop recovery)
+# =============================================================================
+
+class TestPendingToolState:
+    """AwsEventStreamParser.pending_tool_state never finalizes the streaming tool call."""
+
+    def test_empty_parser(self):
+        """
+        What it does: Fresh parser.
+        Goal: ([], None).
+        """
+        assert AwsEventStreamParser().pending_tool_state() == ([], None)
+
+    def test_interrupted_tool_keeps_raw_partial_args(self, aws_frames):
+        """
+        What it does: Tool start plus two input fragments, no stop frame.
+        Goal: The interrupted tool carries the RAW partial JSON (not "{}") and nothing is completed.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("Write", "t1"),
+            aws_frames.tool_input('{"path": "/a', "Write", "t1"),
+            aws_frames.tool_input('b", "content": "x', "Write", "t1"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert completed == []
+        assert interrupted["id"] == "t1"
+        assert interrupted["function"]["name"] == "Write"
+        assert interrupted["function"]["arguments"] == '{"path": "/ab", "content": "x'
+
+    def test_completed_and_interrupted_split(self, aws_frames):
+        """
+        What it does: First tool complete (stop frame), second tool still streaming.
+        Goal: First is in completed with normalized args, second is interrupted with raw args.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.tool_start("B", "t2"),
+            aws_frames.tool_input('{"y": [1,', "B", "t2"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert [t["id"] for t in completed] == ["t1"]
+        assert completed[0]["function"]["arguments"] == '{"x": 1}'
+        assert interrupted["id"] == "t2"
+        assert interrupted["function"]["arguments"] == '{"y": [1,'
+
+    def test_two_tools_only_second_is_interrupted_after_stop_of_first(self, aws_frames):
+        """
+        What it does: Complete tool followed by text, no second tool.
+        Goal: interrupted is None.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.content("done"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert len(completed) == 1 and interrupted is None
+
+    def test_repeated_start_with_same_id_is_not_listed_as_completed(self, aws_frames):
+        """
+        What it does: The same toolUseId is started twice (the first fragment gets closed by the
+        second start), then the stream drops while the second one is still streaming.
+        Goal: The id appears only as the interrupted tool, never also as completed (a duplicate
+        toolUseId in the continuation request is rejected by Kiro with HTTP 400).
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x', "A", "t1"),
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1, "y', "A", "t1"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert interrupted is not None and interrupted["id"] == "t1"
+        assert [t["id"] for t in completed if t["id"] == "t1"] == []
+
+    def test_other_completed_tools_are_kept_when_ids_differ(self, aws_frames):
+        """
+        What it does: Completed t1, then repeated starts of t2 and a drop.
+        Goal: t1 stays completed, t2 is only interrupted.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.tool_start("B", "t2"),
+            aws_frames.tool_start("B", "t2"),
+            aws_frames.tool_input('{"y', "B", "t2"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert [t["id"] for t in completed] == ["t1"]
+        assert interrupted["id"] == "t2"
+
+    def test_empty_args_interrupted_tool(self, aws_frames):
+        """
+        What it does: Tool start only.
+        Goal: Interrupted with empty arguments string.
+        """
+        parser, _ = _parse_chunks([aws_frames.tool_start("A", "t1")])
+        _, interrupted = parser.pending_tool_state()
+        assert interrupted["function"]["arguments"] == ""
+
+    def test_does_not_mutate_the_parser(self, aws_frames):
+        """
+        What it does: Calls pending_tool_state twice and then finalizes through get_tool_calls.
+        Goal: State is identical before and after; the finalization afterwards still normalizes
+        the broken args to "{}" (proving nothing was finalized early).
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": ', "A", "t1"),
+        ])
+        first = parser.pending_tool_state()
+        second = parser.pending_tool_state()
+        assert first == second
+        assert parser.current_tool_call is not None
+        assert parser.tool_calls == []
+        assert parser.get_tool_calls()[0]["function"]["arguments"] == "{}"
+
+    def test_returned_dicts_are_copies(self, aws_frames):
+        """
+        What it does: Mutates the returned dicts.
+        Goal: The parser state does not change.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.tool_start("B", "t2"),
+            aws_frames.tool_input('{"y', "B", "t2"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        completed[0]["function"]["arguments"] = "changed"
+        interrupted["function"]["arguments"] = "changed"
+        assert parser.tool_calls[0]["function"]["arguments"] == '{"x": 1}'
+        assert parser.current_tool_call["function"]["arguments"] == '{"y'
+
+    def test_duplicate_completed_tools_are_deduplicated(self, aws_frames):
+        """
+        What it does: The same tool id is completed twice.
+        Goal: Only one completed copy is returned.
+        """
+        parser, _ = _parse_chunks([
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+            aws_frames.tool_start("A", "t1"),
+            aws_frames.tool_input('{"x": 1}', "A", "t1"),
+            aws_frames.tool_stop("A", "t1"),
+        ])
+        completed, interrupted = parser.pending_tool_state()
+        assert len(completed) == 1 and interrupted is None

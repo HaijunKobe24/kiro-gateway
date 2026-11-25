@@ -51,11 +51,16 @@ from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.streaming_openai import stream_kiro_to_openai, collect_stream_response, stream_with_first_token_retry
 from kiro.streaming_core import aclose_shielded, prime_sse_stream
+from kiro.stream_recovery import RecoverySettings, UpstreamStreamInterrupted
 from kiro.upstream_guard import EmptyUpstreamResponseError
-from kiro.empty_response import build_empty_response_context, handle_empty_response_openai
+from kiro.empty_response import (
+    build_empty_response_context,
+    handle_empty_response_openai,
+    handle_stream_interrupted_openai,
+)
 from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
-from kiro.config import WEB_SEARCH_ENABLED
+from kiro.config import WEB_SEARCH_ENABLED, FIRST_TOKEN_MAX_RETRIES
 from kiro.mcp_tools import handle_native_web_search
 
 # Import debug_logger
@@ -378,9 +383,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     
                     if request_data.stream:
                         # Streaming mode
-                        async def make_retry_request():
+                        async def make_retry_request(payload=None):
                             return await http_client.request_with_retry(
-                                "POST", url, kiro_payload, stream=True
+                                "POST", url, payload or kiro_payload, stream=True
                             )
                         
                         # Wait for the upstream to prove it is not empty BEFORE the
@@ -397,6 +402,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 request_messages=messages_for_tokenizer,
                                 request_tools=tools_for_tokenizer,
                                 emit_ready_marker=True,
+                                recovery=RecoverySettings(
+                                    payload=kiro_payload,
+                                    make_request=make_retry_request,
+                                    max_attempts=FIRST_TOKEN_MAX_RETRIES,
+                                ),
                             )
                         )
                         await account_manager.report_success(account.id, request_data.model)
@@ -437,6 +447,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     
                     else:
                         # Non-streaming mode
+                        async def make_retry_request(payload=None):
+                            return await http_client.request_with_retry(
+                                "POST", url, payload or kiro_payload, stream=True
+                            )
+                        
                         openai_response = await collect_stream_response(
                             http_client.client,
                             response,
@@ -444,7 +459,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             model_cache,
                             auth_manager,
                             request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
+                            request_tools=tools_for_tokenizer,
+                            recovery=RecoverySettings(
+                                payload=kiro_payload,
+                                make_request=make_retry_request,
+                                max_attempts=FIRST_TOKEN_MAX_RETRIES,
+                            ),
                         )
                         await account_manager.report_success(account.id, request_data.model)
                         
@@ -536,6 +556,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         messages_for_tokenizer, tools_for_tokenizer,
                     ),
                 )
+            except UpstreamStreamInterrupted as e:
+                # Non-streaming recovery gave up after a mid-stream drop: not an account
+                # problem (no report_failure, no failover), the client gets a retryable 502
+                await http_client.close()
+                return handle_stream_interrupted_openai(e, request_data.model)
             except HTTPException as e:
                 await http_client.close()
                 
@@ -701,9 +726,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         if request_data.stream:
             # Streaming mode with first token retry
             # Create retry request function for retries
-            async def make_retry_request():
+            async def make_retry_request(payload=None):
                 return await http_client.request_with_retry(
-                    "POST", url, kiro_payload, stream=True
+                    "POST", url, payload or kiro_payload, stream=True
                 )
             
             # Wait for the upstream to prove it is not empty BEFORE the StreamingResponse
@@ -719,6 +744,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     request_messages=messages_for_tokenizer,
                     request_tools=tools_for_tokenizer,
                     emit_ready_marker=True,
+                    recovery=RecoverySettings(
+                        payload=kiro_payload,
+                        make_request=make_retry_request,
+                        max_attempts=FIRST_TOKEN_MAX_RETRIES,
+                    ),
                 )
             )
             
@@ -764,6 +794,11 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         else:
             
             # Non-streaming mode - collect entire response
+            async def make_retry_request(payload=None):
+                return await http_client.request_with_retry(
+                    "POST", url, payload or kiro_payload, stream=True
+                )
+            
             openai_response = await collect_stream_response(
                 http_client.client,
                 response,
@@ -771,7 +806,12 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 model_cache,
                 auth_manager,
                 request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
+                request_tools=tools_for_tokenizer,
+                recovery=RecoverySettings(
+                    payload=kiro_payload,
+                    make_request=make_retry_request,
+                    max_attempts=FIRST_TOKEN_MAX_RETRIES,
+                ),
             )
             
             await http_client.close()
@@ -799,6 +839,10 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 messages_for_tokenizer, tools_for_tokenizer,
             ),
         )
+    except UpstreamStreamInterrupted as e:
+        # Non-streaming recovery gave up after a mid-stream drop: retryable 502
+        await http_client.close()
+        return handle_stream_interrupted_openai(e, request_data.model)
     except HTTPException as e:
         await http_client.close()
         

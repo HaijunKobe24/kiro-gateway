@@ -504,6 +504,32 @@ INCOMPLETE_RESPONSE_AS_ERROR: bool = _parse_switch(
     "INCOMPLETE_RESPONSE_AS_ERROR", os.getenv("INCOMPLETE_RESPONSE_AS_ERROR", "true")
 )
 
+# Recover from an upstream connection drop in the middle of a response (httpx
+# RemoteProtocolError "incomplete chunked read" or ReadError), the way the Kiro IDE does.
+# Applies to streaming and non-streaming requests, OpenAI and Anthropic API alike. Backoff
+# before every retry: 500ms * 2^(n-1), +-20% jitter. What happens depends on what the dropped
+# attempt had produced:
+#   - a tool call was streaming: keep the partial text and tool call, add a failed tool result
+#     ("The tool was NOT executed because its input stream was interrupted. ...") to the
+#     request sent to Kiro only, and ask the model to continue; at most 3 recoveries per
+#     response. The continuation is streamed into the same HTTP response (one role chunk /
+#     message_start, tool calls and usage aggregated);
+#   - nothing produced yet: resend the request unchanged (shares the FIRST_TOKEN_MAX_RETRIES
+#     attempt budget);
+#   - only text produced: resend once with the partial text in the history, the new output is
+#     forwarded as is (text may repeat);
+#   - only reasoning produced: no recovery;
+#   - a tool call was complete (or the usage metering arrived): no resend, the response ends
+#     normally.
+# When recovery is not possible or exhausted, the client gets an explicit error: streaming ends
+# with an in-stream error (OpenAI: {"error": ...} chunk and [DONE]; Anthropic: "event: error"),
+# non-streaming answers HTTP 502, both with "Your connection was interrupted. Please try
+# again in a moment.". Every drop and decision is logged ([StreamDrop], [StreamRecovery]) with
+# counts and timings only, never content.
+# Default: true. Same parsing as EMPTY_RESPONSE_AS_ERROR. false restores the old behavior.
+UPSTREAM_DROP_RETRY: bool = _parse_switch(
+    "UPSTREAM_DROP_RETRY", os.getenv("UPSTREAM_DROP_RETRY", "true")
+)
 # "type" of the Anthropic in-stream error event sent for an incomplete response.
 # Allowed: overloaded_error (default), api_error. Anything else falls back to the default
 # and logs a startup WARNING. Has no effect on OpenAI (always type "server_error").

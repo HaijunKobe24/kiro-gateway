@@ -29,9 +29,10 @@ Contains classes and functions for:
 """
 
 import codecs
+import copy
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -629,6 +630,30 @@ class AwsEventStreamParser:
         if self.current_tool_call:
             self._finalize_tool_call()
         return deduplicate_tool_calls(self.tool_calls)
+    
+    def pending_tool_state(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Returns the tool state without finalizing anything (used when a stream drops).
+        
+        Unlike get_tool_calls(), the tool call that is still streaming is NOT finalized, so
+        its raw partial arguments (possibly incomplete JSON) are preserved. The parser is
+        not modified and the returned dicts are deep copies.
+        
+        Returns:
+            Tuple (completed, interrupted):
+            - completed: copies of the tool calls whose stop frame arrived (or that were
+              closed by the start of the next tool call), duplicates removed
+            - interrupted: copy of the tool call that was still streaming, or None
+        """
+        completed = copy.deepcopy(deduplicate_tool_calls(self.tool_calls))
+        interrupted = copy.deepcopy(self.current_tool_call) if self.current_tool_call else None
+        if interrupted is not None:
+            # Kiro can repeat a tool start frame with the same toolUseId: the earlier fragment
+            # was closed as a "completed" call. The streaming call is the same tool, so it
+            # must not appear twice (duplicate toolUseIds are rejected upstream with HTTP 400).
+            interrupted_id = interrupted.get("id")
+            completed = [tc for tc in completed if not interrupted_id or tc.get("id") != interrupted_id]
+        return completed, interrupted
     
     def reset(self) -> None:
         """Resets parser state."""
